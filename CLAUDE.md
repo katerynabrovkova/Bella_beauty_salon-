@@ -7,6 +7,29 @@ abstractions, or anything else that isn't a local implementation detail — read
 `docs/DECISIONS.md` first.** It is the source of truth for *why* the system is shaped the way
 it is. If you make a new architectural decision, record it there in the same change.
 
+## Stage-by-stage workflow
+
+This project is built one stage at a time, in the order recorded in
+`docs/DECISIONS.md` under "Agreed stage order." Do not implement ahead of the
+current stage — e.g. don't add domain apps, models, or endpoints that belong
+to a later stage.
+
+Before implementing any stage:
+
+1. Analyze the requirements for that stage.
+2. Explain the proposed approach.
+3. State assumptions explicitly — do not silently invent requirements.
+4. Identify edge cases.
+5. Propose the relevant files/architecture.
+6. **Wait for explicit instruction before writing code.**
+
+When implementing:
+
+- Make small, logically grouped changes; don't rewrite unrelated code.
+- Don't silently change architecture — if something in `docs/DECISIONS.md`
+  needs to change, say so and update it in the same change.
+- Run the relevant tests/checks after implementing and report the results.
+
 ## Project purpose
 
 A production-quality, reusable multi-tenant SaaS platform for beauty salons: client-facing
@@ -16,14 +39,15 @@ service catalog. The first tenant is a demo "universal" salon (manicure, pedicur
 lashes, sugaring, laser hair removal); the architecture must support additional independent
 salons without rework.
 
-This is being built incrementally, stage by stage, per `docs/DECISIONS.md` and direction from
-the product owner. Do not build ahead of the current stage — e.g. don't add domain apps,
-models, or endpoints that haven't been explicitly scoped yet.
-
 ## Tech stack
 
-- **Backend:** Python 3.12, Django 5.1, Django REST Framework (added when the first API stage
-  lands), PostgreSQL, Celery + Redis, JWT auth, pytest.
+- **Backend:** Python, Django, PostgreSQL, Celery + Redis, pytest — wired up as of Stage 0.
+  Django REST Framework, JWT auth, and OpenAPI/Swagger are part of the plan but **not yet
+  added** (land with the stages that need them, per `docs/DECISIONS.md`'s stage order). Exact
+  versions live in `backend/requirements/*.txt`, not here — that file is the source of truth
+  and this one will drift if it restates numbers. Version-compatibility reasoning (LTS choice,
+  why some packages are deliberately not pinned to their newest release) lives in
+  `docs/DECISIONS.md`.
 - **Frontend:** Next.js / React, TypeScript (not started yet — backend-first, see
   `docs/DECISIONS.md`).
 - **AI:** LLM access through a provider-agnostic abstraction (not started yet).
@@ -62,11 +86,26 @@ From the repository root:
 ```bash
 cp .env.example .env        # first time only
 docker compose build
+```
+
+`.env.example` ships `DJANGO_SECRET_KEY=change-me-to-a-random-value-in-every-environment` as a
+literal placeholder — it is not safe to run with as-is. Generate a real one and put it in
+`.env`:
+
+```bash
+docker compose run --rm backend python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+```
+
+```bash
 docker compose up
 ```
 
 This starts PostgreSQL, Redis, the Django dev server (`backend`), a Celery worker, and Celery
-beat. The backend is served at `http://localhost:8000`.
+beat. The backend is served on `http://localhost:${HOST_BACKEND_PORT}` (default `8000`).
+Postgres, Redis, and the backend each have an independently configurable host port
+(`HOST_DB_PORT` / `HOST_REDIS_PORT` / `HOST_BACKEND_PORT` in `.env`) — the in-network service
+addresses (`db:5432`, `redis:6379`) never change, only what's exposed to your machine. Override
+these when the defaults collide with another project's containers on the same host.
 
 Run Django management commands inside the `backend` container, e.g.:
 

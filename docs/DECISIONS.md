@@ -11,6 +11,38 @@ so the history stays legible.
 
 ---
 
+## Agreed stage order
+
+The project is built one stage at a time, in this order. Do not implement
+ahead of the current stage. When a decision elsewhere in this file
+references "Stage N," it refers to this list — keep those references in
+sync if the order ever changes.
+
+0. Scaffolding (done)
+1. Detailed backend architecture, written to `docs/ARCHITECTURE.md`, no code
+2. Domain models + migrations
+3. Auth, roles, tenant isolation, guest identity
+4. Catalog (categories, services)
+5. Specialists + reviews — read-only
+6. Availability engine — pure slot computation, read-only, heavily unit-tested
+7. Booking core — creation, statuses, cancellation, concurrency
+8. Payments — provider abstraction, deposit, webhooks, refunds
+9. Celery + notifications (email + channel abstraction)
+10. Telegram adapter
+11. Review submission (completed-appointment gating)
+12. Frontend skeleton — design system, API client, auth
+13. Frontend catalog / service / specialists / reviews
+14. Frontend booking flow + payment + confirmation
+15. Frontend customer account + guest token management
+16. AI assistant backend
+17. AI assistant frontend widget
+18. Admin shell + dashboard + appointments list
+19. Admin calendar + appointment create/edit
+20. Admin services, specialists, working hours, days off
+21. Admin clients, reviews, notifications, statistics
+22. Productionization — Docker, CI/CD, README
+23. Production-readiness audit (fresh session)
+
 ## Overall style
 
 - **Modular monolith**, not microservices. A single Django project with
@@ -30,9 +62,9 @@ so the history stays legible.
   subdomain-based resolution because it works locally without DNS/hosts-file
   changes. The resolution logic must live in a single, isolated middleware
   component so it can be swapped for subdomain-based resolution later
-  without touching every view. **Not yet implemented** — this is a Stage 1
-  (tenant + auth foundation) commitment, recorded now so it isn't
-  improvised differently when that stage starts.
+  without touching every view. **Not yet implemented** — this is a Stage 3
+  (auth, roles, tenant isolation, guest identity) commitment, recorded now
+  so it isn't improvised differently when that stage starts.
 
 ## Identity: Customer vs. User
 
