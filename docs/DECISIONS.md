@@ -96,6 +96,40 @@ so the history stays legible.
   domains are complete on the backend. Avoids building UI against APIs that
   are still shifting shape.
 
+## Dependency versions (Stage 0)
+
+Pins in `backend/requirements/*.txt` are verified against PyPI directly
+(`pip index versions`), not assumed from training knowledge, and checked for
+mutual compatibility via each package's declared `requires_dist`, not just
+"does it install." Two packages are deliberately *not* pinned to their
+newest release because the newest release is incompatible with something
+else in the stack:
+
+- **`redis` is capped at `6.4.0`**, not the newest `8.1.0`. `kombu`
+  (Celery's transport library) declares `redis!=4.5.5,!=5.0.2,<6.5,>=4.5.2`
+  for its `redis` extra. `redis-py` 7.x/8.x are not yet supported by Celery's
+  transport layer — pinning the newest client would leave the Redis
+  broker/result-backend running against an untested, unsupported version.
+  `base.txt` uses `celery[redis]` (not a bare `celery` line) specifically so
+  pip enforces this constraint automatically on any future version bump,
+  instead of relying on a comment staying in sync.
+- **`mypy` is capped at `1.19.1`**, not the newest `2.3.0`. `django-stubs`'s
+  `compatible-mypy` extra declares `mypy<1.20,>=1.13`. Same reasoning:
+  `development.txt` uses `django-stubs[compatible-mypy]` so pip enforces
+  this rather than a comment.
+- **`django-stubs` is pinned to the `5.2.x` line (`5.2.9`)**, not the newest
+  `6.0.9`. `6.0.9` targets Django 6.0 with only partial support for 5.2;
+  `5.2.9` is the line built specifically for our pinned Django 5.2.
+
+**Django is pinned to `5.2.17`** — the latest patch of the current LTS line
+(5.2), not `6.1` (latest overall release, but not LTS) — per the standing
+preference for LTS unless there's a compatibility reason not to.
+
+When bumping any pin later, re-check `requires_dist` for the packages above
+before taking "latest," not just whether `pip install` succeeds — a clean
+install doesn't guarantee the runtime integration (e.g. Celery↔Redis) was
+actually tested against that combination.
+
 ## Stage 0 scope note
 
 Stage 0 is infrastructure and project skeleton only: no domain apps, no
