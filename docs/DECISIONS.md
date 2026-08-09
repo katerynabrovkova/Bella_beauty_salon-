@@ -169,3 +169,64 @@ models, no API endpoints, no business logic. Settings, Docker, Celery
 wiring, and tooling exist so every later stage has a consistent foundation
 to build on — nothing in Stage 0 should need to be revisited for
 architectural reasons, only extended.
+
+## Business rules
+
+Recorded here because these are product decisions that must survive a fresh
+session, not architectural shape — `docs/ARCHITECTURE.md` describes the mechanisms
+that implement them; this section is the source of truth for the actual numbers, so
+they are stated once, not duplicated.
+
+- **Deposit: 20% of service price, paid online at booking.** A single salon-wide
+  setting (`Salon.deposit_percentage`, default 20%), not overridable per service in
+  v1 — add a per-service override only if a real salon actually asks for one.
+- **The remaining 80% is paid in person at the salon.** Not tracked or collected by
+  the platform in any form.
+- **Cancellation ≥ 24 hours before appointment start: deposit refunded.
+  Cancellation < 24 hours before start: deposit forfeited.** A single cutoff, no
+  tiered/partial refund.
+- **Reviews require a `COMPLETED` appointment; exactly one review per appointment.**
+  Guests cannot review (see § Identity above). Reviews are immutable once posted and
+  the salon cannot post a public reply in v1; staff can hide a review, but deletion
+  is not exposed to anyone.
+- **Appointment completion is an automatic scheduled transition**
+  (`CONFIRMED → COMPLETED` once `end_datetime` passes), with a staff override
+  available in the admin for correcting mistakes. Automatic because review
+  eligibility depends on `COMPLETED`, and that can't be left waiting on a staff
+  member remembering to mark every appointment.
+- **`NO_SHOW` is a staff-marked appointment status with no automatic effects in
+  v1** — no customer penalty, and the deposit is already forfeited by that point
+  regardless. It exists purely for admin record-keeping and statistics; revisit
+  once there's a real pattern worth reacting to.
+- **Booking window: minimum 3 hours' lead time, maximum 60 days in advance.**
+  Salon-configurable; these are the defaults.
+- **A `PENDING_PAYMENT` appointment holds its slot for 15 minutes before the
+  expiry sweep releases it.** Fixed for v1, not salon-configurable — this is a
+  payment-UX parameter, not a business lever a salon would tune. Reasoning: long
+  enough to complete a card payment including a 3-D-Secure challenge (which
+  normally resolves in well under 10 minutes), short enough that an abandoned or
+  malicious checkout only blocks a slot briefly rather than making it trivially
+  blockable for an extended window.
+- **Service buffer time blocks the calendar but is never itself offered as a
+  bookable start.** E.g. a 90-minute service with a 15-minute buffer occupies 105
+  minutes of the specialist's schedule; a following appointment may start exactly
+  when the buffer ends. Buffer is set per service (equipment/room turnaround
+  differs by service), not a salon-wide value. See `docs/ARCHITECTURE.md` § 6–7 for
+  the mechanism, including how it's enforced in the double-booking exclusion
+  constraint.
+- **No specialist logins in this build.** Specialists are managed entirely by
+  salon staff/admin; add specialist accounts only if a later stage needs them.
+- **One `SalonStaff` role for v1.** The `role` field is kept on the model so a
+  second role can be added later without a shape migration — only the field's
+  value space grows.
+- **The AI assistant only ever proposes a service and slot; it never creates a
+  binding appointment directly.** The user must confirm through the normal booking
+  flow, which is what actually calls the booking service layer. Chosen over letting
+  the assistant book directly because a hallucinated parameter should never be able
+  to produce a real, paid appointment.
+- **AI assistant memory is session-only, for every customer including logged-in
+  ones — nothing is persisted to a database.** Held in Redis with a TTL instead
+  (see `docs/ARCHITECTURE.md` § 10). Salon chat routinely surfaces health-adjacent
+  personal information (skin conditions, allergies, treatment contraindications);
+  the deliberate choice is to not retain that by default for anyone, rather than
+  carve out an exception for logged-in customers.
