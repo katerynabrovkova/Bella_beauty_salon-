@@ -233,10 +233,12 @@ those writes, not a change in what the source of truth is.
   time (§ 7), not here.
 - A specialist's `WorkingHours` changes after appointments already exist outside the
   new hours — existing appointments are not retroactively invalidated.
-- `TimeOff` added over a slot that's already booked — a real conflict; not resolved
-  by this function (it just won't offer that slot going forward). Handling
-  (warn admin? auto-cancel? require manual resolution?) is an open question, relevant
-  once the admin calendar (Stage 19) exists.
+- `TimeOff`/`WorkingHours` changes that conflict with a slot that's already booked —
+  this function only stops offering that slot going forward; it does not resolve
+  the existing conflict. Detection and resolution (rebook with another specialist,
+  rebook the same specialist later, or a fully-refunded salon-initiated
+  cancellation) is a recorded requirement (`docs/DECISIONS.md` § Business rules),
+  with the resolution UI landing in the admin calendar (Stage 19).
 - A service duration longer than any single open window never produces a slot —
   correct behavior, not a bug.
 - Specialists working across midnight — assumed not to happen (salons close
@@ -279,10 +281,12 @@ On constraint violation, the transaction rolls back and the API returns a
 `SLOT_NO_LONGER_AVAILABLE` domain error (§ 14) — the client's "you lost the race" case.
 
 **Cancellation** transitions `Appointment` to `CANCELLED`, recording who cancelled
-(customer, guest via token, or staff) and why. Refund eligibility is computed from a
-single cutoff against `now()` vs. the appointment start, recorded in
-`docs/DECISIONS.md` § Business rules — referenced here rather than restated so the
-number lives in exactly one place.
+(`cancelled_by`: customer, guest via token, staff, or system) and why. Refund
+eligibility branches on `cancelled_by` first, then, only for a customer-initiated
+cancellation, on a cutoff against `now()` vs. appointment start — a salon-initiated
+cancellation is always fully refunded regardless of timing. The concrete cutoff and
+the full policy are recorded in `docs/DECISIONS.md` § Business rules, not restated
+here.
 
 ## 8. Payments: state machine, deposit calculation, webhook idempotency
 

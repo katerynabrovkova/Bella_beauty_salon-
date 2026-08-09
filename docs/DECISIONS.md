@@ -182,9 +182,24 @@ they are stated once, not duplicated.
   v1 — add a per-service override only if a real salon actually asks for one.
 - **The remaining 80% is paid in person at the salon.** Not tracked or collected by
   the platform in any form.
-- **Cancellation ≥ 24 hours before appointment start: deposit refunded.
-  Cancellation < 24 hours before start: deposit forfeited.** A single cutoff, no
-  tiered/partial refund.
+- **Cancellation refund depends on WHO cancelled, not only WHEN.** For a
+  customer-initiated cancellation: ≥ 24 hours before appointment start, deposit
+  refunded; < 24 hours before start, deposit forfeited (a single cutoff, no
+  tiered/partial refund). For a **salon-initiated cancellation** (specialist
+  illness, `TimeOff` added over an already-booked slot, a working-hours change that
+  displaces a booking, etc.), the deposit is **always fully refunded regardless of
+  timing** — the customer is never penalized for a change the salon made.
+  `Appointment.cancelled_by` is what refund eligibility is computed from; it is not
+  a bare time comparison.
+- **Staff changes to `TimeOff`/`WorkingHours` that conflict with an existing
+  appointment must be detected and explicitly resolved — never silently orphaned.**
+  Affected customers are offered: rebook with another specialist who performs the
+  same service, rebook with the same specialist at a later time, or cancel with a
+  full refund (the salon-initiated-cancellation rule above). The resolution UI/flow
+  itself is Stage 19 (admin calendar) work, not Stage 2 — this only records that the
+  Stage 2 data model must be able to represent the conflict and that the
+  Stage 7/8 cancellation path must support a salon-initiated, always-refunded
+  cancellation reason.
 - **Reviews require a `COMPLETED` appointment; exactly one review per appointment.**
   Guests cannot review (see § Identity above). Reviews are immutable once posted and
   the salon cannot post a public reply in v1; staff can hide a review, but deletion
