@@ -64,6 +64,14 @@ Described, not modeled in code:
   because turnaround differs by service).
 - **Specialist** — salon FK, name, bio, photo. No login in this build (see open
   questions).
+- **`Service` and `Specialist` rows can never be hard-deleted once an `Appointment`
+  references them** — the FK would either cascade-delete real booking history or
+  require `SET NULL`/`PROTECT` gymnastics that make "delete" mean something
+  different depending on whether the row has ever been booked. No
+  `is_active`/soft-deactivation field is added yet (Stage 2 has no admin UI that
+  would set it), but this is a known, recorded gap: admin "remove this service/
+  specialist" (Stage 20) must be a soft deactivation, not a `DELETE`, and the
+  field lands with that stage, not before.
 - **Specialist ↔ Service** — many-to-many; not every specialist performs every
   service.
 - **WorkingHours** — specialist FK, day-of-week, start/end time (recurring weekly
@@ -72,9 +80,15 @@ Described, not modeled in code:
 - **Appointment** — salon FK, customer FK, specialist FK, service FK, start/end
   timestamp (UTC) for the service itself, `blocked_until` (UTC — `end` plus the
   service's buffer minutes at the time of booking, stored rather than recomputed via
-  a join; see § 7), `hold_expires_at` (set at creation for `PENDING_PAYMENT`
-  appointments — see § lifecycle), status (see § lifecycle), audit fields
-  (`created_at`, `cancelled_at`, `cancelled_by`, `cancellation_reason`).
+  a join; see § 7), `service_price_at_booking` and `deposit_percentage_at_booking`
+  (the `Service.price` and `Salon.deposit_percentage` values at the moment of
+  booking, snapshotted onto the row for the same reason as `blocked_until` — if the
+  salon later changes a price or the deposit percentage, an already-made booking's
+  amount owed must not silently change with it; § 8's deposit formula reads these
+  snapshots, never the live `Service`/`Salon` values), `hold_expires_at` (set at
+  creation for `PENDING_PAYMENT` appointments — see § lifecycle), status (see §
+  lifecycle), audit fields (`created_at`, `cancelled_at`, `cancelled_by`,
+  `cancellation_reason`).
 - **Payment** — salon FK, appointment FK (one deposit payment per appointment),
   amount, status (see § lifecycle), provider reference id.
 - **ProcessedWebhookEvent** — provider event id (unique), processed timestamp. Not a
@@ -291,7 +305,11 @@ here.
 ## 8. Payments: state machine, deposit calculation, webhook idempotency
 
 **Deposit calculation:**
-`deposit_amount = round(service.price × salon.deposit_percentage)` — a single
+`deposit_amount = round(appointment.service_price_at_booking ×
+appointment.deposit_percentage_at_booking)` — read from the snapshot stored on the
+`Appointment` at booking time (§ 2), never from the live `Service.price` or
+`Salon.deposit_percentage`, so a later price or deposit-percentage change never
+rewrites what an existing booking owes. The percentage itself is a single
 salon-wide setting, no per-service override in v1 (`docs/DECISIONS.md` § Business
 rules).
 
@@ -318,12 +336,22 @@ method, one adapter per channel.
 
 **Trigger points:** booking confirmed, booking cancelled, appointment reminder
 (scheduled, § 12), payment succeeded/failed, review request after an appointment
-completes.
+completes, **guest→User email verification** (§ 3) — not appointment-scoped at all,
+routed through the same channel abstraction rather than a separate ad hoc email path,
+so verification mail gets the same dedup/idempotency guarantee as everything else
+instead of being a special case that's easy to forget.
 
 **Duplicate-send prevention** uses the same idempotency shape as § 8: a `Notification`
-row is created in `PENDING` status *before* any send is attempted, with a unique
-constraint on a natural key (trigger type, appointment id, channel). The sending task
-only transitions `PENDING → SENT` under that row's lock, so a retried Celery task or a
+row is created in `PENDING` status *before* any send is attempted. `Notification.
+appointment` is **nullable** — verification email has no appointment to hang off —
+so the dedup natural key can't be `(trigger type, appointment id, channel)` as
+originally stated: a nullable column doesn't enforce uniqueness in Postgres (multiple
+`NULL`s never collide). Instead the unique constraint is on `(trigger type, channel,
+dedup_key)`, where `dedup_key` is a plain string the caller populates —
+`f"appointment:{id}"` for appointment-scoped triggers, `f"user:{id}"` for
+verification email — so every trigger type has an explicit, always-populated
+collision key regardless of what it's actually about. The sending task only
+transitions `PENDING → SENT` under that row's lock, so a retried Celery task or a
 duplicate trigger (e.g. a webhook firing twice) cannot produce two emails for the same
 event. Reusing the same pattern in two independent apps (`payments`, `notifications`)
 is intentional consistency, not coincidence.

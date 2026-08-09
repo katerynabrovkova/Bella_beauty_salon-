@@ -245,3 +245,10 @@ they are stated once, not duplicated.
   personal information (skin conditions, allergies, treatment contraindications);
   the deliberate choice is to not retain that by default for anyone, rather than
   carve out an exception for logged-in customers.
+- **`Salon.timezone` defaults to `Europe/Kyiv`.** The demo tenant is a Ukrainian
+  salon; the field is per-salon and overridable at creation (see § Timezone
+  above) — this is only the default for a newly created `Salon` row.
+- **`Salon.slot_granularity_minutes` defaults to 15.** The step size the
+  availability engine (Stage 6) walks a specialist's open windows in when
+  generating candidate start times. Salon-configurable, like the lead-time and
+  advance-window defaults above.

@@ -1,0 +1,82 @@
+from django.db import models
+
+from catalog.models import Service
+from core.models import TenantScopedModel, TimeStamped
+
+
+class Specialist(TenantScopedModel, TimeStamped):
+    name = models.CharField(max_length=255)
+    bio = models.TextField(blank=True)
+
+    services = models.ManyToManyField(Service, through="SpecialistService", related_name="specialists")
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class SpecialistService(TenantScopedModel, TimeStamped):
+    """
+    Explicit Specialist<->Service through model, not a bare ManyToManyField —
+    needed so the pairing itself can carry the composite cross-tenant FK
+    protection on both sides (docs/ARCHITECTURE.md § 5).
+    """
+
+    specialist = models.ForeignKey(Specialist, on_delete=models.CASCADE)
+    service = models.ForeignKey(Service, on_delete=models.CASCADE)
+
+    class Meta(TenantScopedModel.Meta):
+        abstract = False
+        constraints = [
+            *TenantScopedModel.Meta.constraints,
+            models.UniqueConstraint(
+                fields=["specialist", "service"], name="specialistservice_specialist_service_uniq"
+            ),
+        ]
+
+
+class DayOfWeek(models.IntegerChoices):
+    MONDAY = 0, "Monday"
+    TUESDAY = 1, "Tuesday"
+    WEDNESDAY = 2, "Wednesday"
+    THURSDAY = 3, "Thursday"
+    FRIDAY = 4, "Friday"
+    SATURDAY = 5, "Saturday"
+    SUNDAY = 6, "Sunday"
+
+
+class WorkingHours(TenantScopedModel, TimeStamped):
+    """Recurring weekly template. Multiple rows per day are allowed (split shifts)."""
+
+    specialist = models.ForeignKey(Specialist, on_delete=models.CASCADE, related_name="working_hours")
+    day_of_week = models.IntegerField(choices=DayOfWeek.choices)
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+
+    class Meta(TenantScopedModel.Meta):
+        abstract = False
+        constraints = [
+            *TenantScopedModel.Meta.constraints,
+            models.CheckConstraint(
+                condition=models.Q(start_time__lt=models.F("end_time")),
+                name="workinghours_start_before_end",
+            ),
+        ]
+
+
+class TimeOff(TenantScopedModel, TimeStamped):
+    """Dated exception to WorkingHours (illness, vacation, ...)."""
+
+    specialist = models.ForeignKey(Specialist, on_delete=models.CASCADE, related_name="time_off")
+    start_datetime = models.DateTimeField()
+    end_datetime = models.DateTimeField()
+    reason = models.CharField(max_length=255, blank=True)
+
+    class Meta(TenantScopedModel.Meta):
+        abstract = False
+        constraints = [
+            *TenantScopedModel.Meta.constraints,
+            models.CheckConstraint(
+                condition=models.Q(start_datetime__lt=models.F("end_datetime")),
+                name="timeoff_start_before_end",
+            ),
+        ]
