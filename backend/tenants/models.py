@@ -13,6 +13,11 @@ class Salon(TimeStamped):
     name = models.CharField(max_length=255)
     slug = models.SlugField(unique=True)
 
+    # Drives the Stage 3 tenant-resolution middleware's 404 for a deactivated
+    # tenant (docs/DECISIONS.md § Stage 3 decisions) — deliberately not a
+    # delete, since Salon is the FK target for every tenant-owned row.
+    is_active = models.BooleanField(default=True)
+
     # Local-time rendering input (docs/DECISIONS.md § Timezone). Default is
     # the demo tenant's own timezone, not a platform-wide assumption.
     timezone = models.CharField(max_length=63, default="Europe/Kyiv")

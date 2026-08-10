@@ -265,3 +265,56 @@ they are stated once, not duplicated.
   from any one-time reformat diff was effectively zero — revisit only if a future need for
   byte-for-byte black compatibility (e.g. an external tool that assumes black output)
   comes up.
+
+## Stage 3 decisions (auth, roles, tenant isolation, guest identity)
+
+- **Tenant-resolution middleware placement: last in `MIDDLEWARE`.** Not because it
+  depends on `request.user` (it doesn't — salon resolution is a pure slug lookup, and
+  JWT auth runs inside DRF view dispatch, not in `AuthenticationMiddleware`, which only
+  populates session-based auth for Django admin). Placed last so the `tenant_context`
+  binding window is as narrow as possible — it wraps only the view, not any other
+  middleware's request/response processing. Revisit only if a future middleware
+  genuinely needs tenant context bound around it.
+- **Unknown or inactive salon slug → `404`, not `403`.** The slug is part of the URL
+  path, not a credential — a nonexistent salon is a routing miss. `404` also avoids
+  confirming/denying slug existence differently to authorized vs. unauthorized callers.
+  Both cases resolve through the same query (`Salon.objects.filter(slug=slug,
+  is_active=True)`) so there is no code path that could accidentally distinguish them
+  in the response.
+- **Guest token: signed value, only its hash stored.** `GuestAccessToken` stores
+  `token_hash` (SHA-256 of the signed token), never the raw token — a database dump
+  must not hand out working links. Validation re-hashes the presented token and looks
+  up by hash.
+- **Guest token: `cancelled_via_token_at`, not a blanket `consumed_at`.** Viewing and
+  cancelling are separate capabilities of the same token; a single "consumed" flag
+  would kill view access the moment the guest cancels, which is wrong — they should
+  still be able to see the cancelled appointment afterward.
+- **Guest token expiry: 30 days after `Appointment.end_datetime`**, not 90. The link
+  sits in an inbox indefinitely; a shorter window bounds the blast radius if that
+  inbox is compromised or the mail is forwarded, while still covering the realistic
+  window for viewing/cancelling a recent booking.
+- **Guest token transport: URL fragment in the emailed link, header on the API call.**
+  The email links to a frontend route with the token in the URL **fragment**
+  (`#token=...`), never a query string. A fragment is never transmitted in any HTTP
+  request — not to the frontend server, not in `Referer` to third-party resources the
+  page loads — so it reaches no access log anywhere, frontend or backend. Frontend JS
+  reads `window.location.hash` client-side and sends the token to the API as an
+  `X-Guest-Token` header on view/cancel requests. This is what keeps the token out of
+  Django's (and any WSGI server's) request logs, which record method + path + query
+  string, not arbitrary headers. Browser history still retains the full URL regardless
+  of query-vs-fragment — that residual risk is bounded by the hash-only storage and
+  30-day expiry above, not eliminated by transport choice.
+- **Throttle rates** (DRF `ScopedRateThrottle`, keyed by IP — all four are pre-auth or
+  guest endpoints with no user id to key on): `login` 5/min (blunts credential
+  stuffing from one source, allows normal typo-retry); `password_reset` 3/hour and
+  `resend_verification` 3/hour (both trigger an email send to a third party, so
+  tighter than login — abuse here means spamming someone else's inbox, not just
+  guessing a password); `guest_token` 20/min (the token is a signed value, not
+  brute-forceable in a human timeframe, so this guards against endpoint hammering
+  rather than credential guessing).
+- **Registration and password-reset-request never reveal whether an email exists.**
+  Both return an identical response (status, body) regardless of whether the email is
+  already registered, and enqueue a Celery task either way so response timing doesn't
+  diverge on that branch. On a duplicate registration email, a "you already have an
+  account" notice is sent instead of creating a second row — the caller-visible
+  response is the same either way.

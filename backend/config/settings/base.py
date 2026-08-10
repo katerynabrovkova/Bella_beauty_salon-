@@ -53,6 +53,9 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    # Last: see tenants.middleware.TenantResolutionMiddleware's docstring and
+    # docs/DECISIONS.md § Stage 3 decisions for why.
+    "tenants.middleware.TenantResolutionMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"
