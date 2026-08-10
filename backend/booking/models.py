@@ -99,3 +99,32 @@ class Appointment(TenantScopedModel, TimeStamped):
 
     def __str__(self) -> str:
         return f"{self.customer} / {self.specialist} @ {self.start_datetime.isoformat()}"
+
+
+class GuestAccessToken(TenantScopedModel, TimeStamped):
+    """
+    Guest view/cancel access to a single Appointment via a signed,
+    single-purpose token (docs/ARCHITECTURE.md § 3, docs/DECISIONS.md §
+    Stage 3 decisions). Only the SHA-256 hash of the issued token is stored
+    — see booking/guest_tokens.py for issuance/validation. Lives in
+    `booking`, not `accounts`, because it FKs Appointment and booking
+    already depends on accounts, not the reverse.
+
+    `cancelled_via_token_at` is deliberately separate from `expires_at`: it
+    gates the *cancel* capability only, so a guest can still view a
+    cancelled appointment through the same link afterward.
+    """
+
+    appointment = models.ForeignKey(
+        Appointment, on_delete=models.CASCADE, related_name="guest_access_tokens"
+    )
+    token_hash = models.CharField(max_length=64, unique=True)
+    expires_at = models.DateTimeField()
+    cancelled_via_token_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta(TenantScopedModel.Meta):
+        abstract = False
+        constraints = [*TenantScopedModel.Meta.constraints]
+
+    def __str__(self) -> str:
+        return f"guest token for appointment {self.appointment_id}"

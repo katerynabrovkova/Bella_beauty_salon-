@@ -1,0 +1,125 @@
+"""
+DRF permission classes for roles, tenant-scoped staff access, customer
+ownership, and guest-token access (docs/ARCHITECTURE.md § 4). These are a
+second line of defense on writes — the tenant-scoped manager (core.models)
+is the first line, so a missing permission check fails toward "wrong data
+invisible," not "wrong data mutable."
+"""
+
+from rest_framework.permissions import BasePermission
+from rest_framework.request import Request
+from rest_framework.views import APIView
+
+from accounts.models import Customer, SalonStaff
+from booking.guest_tokens import validate_guest_token
+from booking.models import Appointment
+from core.tenancy import get_current_salon_id
+
+
+def IsSalonStaff(*roles: str) -> type[BasePermission]:
+    """
+    Factory: `permission_classes = [IsSalonStaff()]` for any staff role, or
+    `[IsSalonStaff(SalonStaffRole.ADMIN)]` to restrict to specific roles.
+    Checks a SalonStaff row exists for request.user in the currently bound
+    tenant (docs/ARCHITECTURE.md § 4).
+    """
+
+    class _IsSalonStaff(BasePermission):
+        def has_permission(self, request: Request, view: APIView) -> bool:
+            if not (request.user and request.user.is_authenticated):
+                return False
+            salon_id = get_current_salon_id()
+            if salon_id is None:
+                return False
+            qs = SalonStaff.objects.filter(user=request.user)
+            if roles:
+                qs = qs.filter(role__in=roles)
+            return qs.exists()
+
+    return _IsSalonStaff
+
+
+class IsAuthenticatedCustomer(BasePermission):
+    """
+    request.user is authenticated and has a Customer row in the currently
+    bound tenant (docs/ARCHITECTURE.md § 4 "Customer" role).
+    """
+
+    def has_permission(self, request: Request, view: APIView) -> bool:
+        if not (request.user and request.user.is_authenticated):
+            return False
+        salon_id = get_current_salon_id()
+        if salon_id is None:
+            return False
+        return Customer.objects.filter(user=request.user).exists()
+
+
+class IsOwnCustomer(BasePermission):
+    """
+    Object-level: the acting Customer matches obj.customer
+    (docs/ARCHITECTURE.md § 4). "Acting Customer" comes from either a
+    JWT-authenticated user's linked Customer row, or a validated guest
+    token — relies on HasValidGuestToken having already run and attached
+    request.guest_access_token when acting as a guest.
+    """
+
+    def has_object_permission(self, request: Request, view: APIView, obj: object) -> bool:
+        customer_id = self._acting_customer_id(request)
+        if customer_id is None:
+            return False
+        return getattr(obj, "customer_id", None) == customer_id
+
+    @staticmethod
+    def _acting_customer_id(request: Request) -> int | None:
+        guest_token = getattr(request, "guest_access_token", None)
+        if guest_token is not None:
+            return guest_token.appointment.customer_id
+        if request.user and request.user.is_authenticated:
+            salon_id = get_current_salon_id()
+            if salon_id is None:
+                return None
+            customer = Customer.objects.filter(user=request.user).first()
+            return customer.id if customer else None
+        return None
+
+
+class HasValidGuestToken(BasePermission):
+    """
+    Validates the X-Guest-Token header (docs/ARCHITECTURE.md § 3, § 4). See
+    CLAUDE.md's "DRF object-level permissions" rule for why this class does
+    its real work in has_permission rather than has_object_permission: the
+    latter is only invoked by views that explicitly call
+    check_object_permissions() (DRF generics do this automatically inside
+    get_object(); a plain APIView must call it itself) — a permission class
+    that only checks the object is a silent no-op on any view shape that
+    never reaches that call, e.g. a hypothetical list endpoint.
+
+    Every view listing this permission must declare `guest_token_action` as
+    exactly "view" or "cancel", with no default — has_permission denies if
+    it's missing or invalid, so a view that forgets to configure this fails
+    closed instead of silently defaulting to "view" mode. Only "cancel"
+    treats an already-spent cancel capability as invalid
+    (docs/DECISIONS.md § Stage 3 decisions: cancelling must not revoke view
+    access).
+
+    On success, stashes the validated GuestAccessToken on
+    request.guest_access_token — note its `appointment_id` is the
+    authoritative target appointment; views must resolve the object *from*
+    this, never validate this *against* a separately-sourced (e.g.
+    URL-supplied) id (see booking/views.py's _GuestTokenAppointmentMixin).
+    has_object_permission is a second, redundant confirmation once the
+    object is fetched — defense in depth, not the only check.
+    """
+
+    def has_permission(self, request: Request, view: APIView) -> bool:
+        action = getattr(view, "guest_token_action", None)
+        if action not in ("view", "cancel"):
+            return False
+        raw_token = request.headers.get("X-Guest-Token", "")
+        token_row = validate_guest_token(raw_token, for_cancel=(action == "cancel"))
+        request.guest_access_token = token_row  # type: ignore[attr-defined]
+        return True
+
+    def has_object_permission(self, request: Request, view: APIView, obj: Appointment) -> bool:
+        token_row = getattr(request, "guest_access_token", None)
+        return token_row is not None and token_row.appointment_id == obj.id

@@ -25,6 +25,7 @@ from accounts.serializers import (
     ResendVerificationSerializer,
     VerifyEmailSerializer,
 )
+from accounts.services import link_guest_customers
 from accounts.tasks import (
     send_account_exists_email,
     send_password_reset_email,
@@ -90,6 +91,10 @@ class VerifyEmailView(APIView):
         User.objects.filter(pk=user_id, email_verified_at__isnull=True).update(
             email_verified_at=timezone.now()
         )
+        # Guest -> account linking only happens after email verification
+        # (docs/DECISIONS.md § Identity) — safe to call unconditionally,
+        # link_guest_customers is itself idempotent.
+        link_guest_customers(User.objects.get(pk=user_id))
         return Response({"detail": "Email verified."}, status=status.HTTP_200_OK)
 
 

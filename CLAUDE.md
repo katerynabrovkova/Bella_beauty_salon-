@@ -91,6 +91,23 @@ salons without rework.
   to one vendor's SDK from business logic. Tests must never require network access.
 - No hardcoded secrets or credentials, ever. All configuration is environment-driven
   (`django-environ`); `.env` is gitignored, `.env.example` documents every variable.
+- **DRF object-level permissions (`has_object_permission`) never fire on their own for
+  list/collection views** — DRF only calls `check_object_permissions()` when a view
+  explicitly triggers it (its generic views do this automatically inside
+  `get_object()`; a plain `APIView` must call it itself). A permission class that puts
+  its real check only in `has_object_permission` is a silent no-op on any view shape
+  that never reaches that call — nothing stops a future list endpoint from citing that
+  permission class and exposing everything. Every permission class must therefore
+  enforce in `has_permission` whatever it can without the object (explicit required
+  marker attributes with no silently-safe default, credential/token validation that
+  doesn't depend on the specific object, etc.), and object-scoped views should prefer
+  DRF generics specifically because their `get_object()` guarantees the call. See
+  `core/permissions.py`'s `HasValidGuestToken` and `booking/views.py`'s
+  `_GuestTokenAppointmentMixin` for the pattern: `has_permission` does the real
+  validation and resolves which object to act on from the credential itself (never
+  from a URL parameter, which a view could be tricked into using without the
+  corresponding object-permission check ever running); `has_object_permission` is only
+  a redundant confirmation once the object is fetched.
 
 ## Coding conventions
 

@@ -41,6 +41,12 @@ class InvalidOrExpiredTokenError(DomainError):
     default_message = "This link is invalid or has expired."
 
 
+class InvalidStateTransitionError(DomainError):
+    code = "invalid_state_transition"
+    status_code = status.HTTP_409_CONFLICT
+    default_message = "This action isn't valid for the current state."
+
+
 def _envelope(*, code: str, message: str, details: dict | None = None) -> dict:
     return {"error": {"code": code, "message": message, "details": details or {}}}
 

@@ -376,3 +376,74 @@ they are stated once, not duplicated.
     `USERNAME_FIELD` is right for this product) but not the process, and approved it
     after the fact. The rule this produced — model/manager/migration changes of this
     kind must be raised and approved *before* implementation — is now in `CLAUDE.md`.
+
+## Stage 3 sub-step 3 decisions (roles, permissions, guest identity)
+
+- **`GuestAccessToken` lives in `booking`, not `accounts`, and is a full
+  `TenantScopedModel`.** It FKs `Appointment`, and `booking` already depends on
+  `accounts` (via `Customer`), never the reverse — putting it in `accounts` would have
+  introduced a new backward dependency for one model. As a `TenantScopedModel` it gets
+  the standard `salon` FK, the composite `(id, salon)` unique constraint, and a
+  `composite_tenant_fk` on its `appointment` FK, same as every other tenant-owned
+  model. This works cleanly with the tenant-resolution middleware because the guest
+  endpoints are single-object routes nested under `/api/v1/salons/<slug>/...` — tenant
+  context is already bound by the time the permission class or view touches
+  `GuestAccessToken.objects`. It also means a token issued for one salon, presented
+  against a different salon's URL, is simply invisible to the hash lookup (filtered to
+  the current tenant first) — cross-salon token misuse collapses into the same
+  "not found" path as any other invalid token, with no separate check needed.
+- **Every guest-token failure path raises the same `InvalidOrExpiredTokenError`.** Bad
+  signature, unknown hash, expired, and — for the cancel action only — a cancel
+  capability already spent, all produce the identical 400 response (same code,
+  message, status). This runs inside `HasValidGuestToken.has_permission` (not
+  `has_object_permission` — see the next decision for why), so DRF's own exception
+  propagation carries it to the shared envelope; there's no hand-written branch that
+  could leak which case fired. A URL/token appointment mismatch produces the same
+  error too, but from a different place — see below.
+- **`HasValidGuestToken` does its real validation in `has_permission`, not
+  `has_object_permission`, and every view using it must be a DRF generic, not a plain
+  `APIView`.** DRF only calls `check_object_permissions()` (and therefore
+  `has_object_permission`) when a view explicitly triggers it — its generic views do
+  this automatically inside `get_object()`; a plain `APIView` has to call it itself.
+  The original version of this permission put all its logic in `has_object_permission`
+  and returned `True` unconditionally from `has_permission`, which meant a future view
+  that forgot to call `check_object_permissions` (e.g. a list endpoint) would silently
+  let every request through. Closed with four layers, not one:
+  1. **Fail-closed marker**: `has_permission` requires `guest_token_action` to be
+     exactly `"view"` or `"cancel"`, with no default — a view that forgets to declare
+     it is denied, not silently treated as `"view"`.
+  2. **DRF generics**: both guest views (`booking/views.py`) are now
+     `generics.RetrieveAPIView`/`generics.GenericAPIView` subclasses, whose
+     `get_object()` calls `check_object_permissions()` automatically — removing "the
+     view forgot to call it" as a failure mode for these two endpoints.
+  3. **Token-driven object resolution**: `_GuestTokenAppointmentMixin.get_object()`
+     resolves the target `Appointment` from `request.guest_access_token.appointment_id`
+     (set by `has_permission`), never from the URL's `appointment_id` — so even if
+     `check_object_permissions` were somehow skipped, the wrong appointment is never
+     fetched in the first place, because the lookup itself is keyed off the token. The
+     URL id is still compared and must match, purely so a stale or wrong link fails
+     loudly instead of silently ignoring what's in the address bar.
+  4. **Test-level backstop**: `tests/test_guest_token_permission_safety.py` walks every
+     URL pattern using `HasValidGuestToken` and asserts the view is a DRF generic —
+     catches a future plain-`APIView` regression in CI rather than in production.
+  None of this is airtight on its own — DRF's object-permission mechanism is
+  fundamentally opt-in per view, and no permission class can force
+  `check_object_permissions()` to run — so the combination is the mitigation, not any
+  single layer. The general rule (not just this one permission class) is now in
+  `CLAUDE.md`.
+- **The guest -> registered-`User` merge (on email verification) is a per-salon loop
+  (`for salon_id in Salon.objects.values_list(...): with tenant_context(salon_id):
+  Customer.objects.filter(...).update(user=user)`), not `Customer.unscoped_objects`.**
+  `Salon` itself isn't tenant-scoped, so enumerating every salon needs no special
+  access, and looping keeps this — the one deliberately cross-tenant operation in
+  Stage 3 — narrow and explicit rather than reaching for the broader
+  `unscoped_objects` bypass reserved for cases where the salon set isn't already
+  known.
+- **A guest cancel only handles the two transitions the state machine already
+  documents** (`PENDING_PAYMENT`/`CONFIRMED` → `CANCELLED`); any other starting status
+  is rejected with a new `InvalidStateTransitionError` (409) — an ordinary,
+  distinguishable domain error, not a guest-token security concern, so it doesn't hide
+  behind the generic envelope above. Refund eligibility and the full concurrency-safe
+  cancellation service layer remain Stage 8 and Stage 7 work respectively; this only
+  flips the appointment's own status, with a comment marking where Stage 8's refund
+  hook goes.
