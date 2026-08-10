@@ -117,13 +117,17 @@ customers who choose to register and for salon staff.
 **Guests (`Customer` with `user=NULL`).** No login at all. At booking time, the
 customer supplies name/email/phone; the `accounts` service layer does a `salon`-scoped
 get-or-create on `Customer` by email (per `docs/DECISIONS.md`, email is unique per
-salon, so a returning guest updates their existing row). The confirmation email
-contains a signed, single-use link (Django's `core.signing`, keyed off `SECRET_KEY`)
-encoding the `Customer`/`Appointment` id and an expiry, used to view/cancel the
-booking without an account. "Single-use" is enforced by a `consumed_at` timestamp on
-the token record (bare `django.core.signing` alone is stateless and replayable, so a
-small token-tracking table is needed) — signature validity and the `consumed_at` check
-both gate access.
+salon, so a returning guest updates their existing row). The confirmation email links
+to a frontend route with a signed token (Django's `core.signing`, keyed off
+`SECRET_KEY`, encoding the `Customer`/`Appointment` id) in the URL **fragment**
+(`#token=...`), never a query string. A `GuestAccessToken` row stores the SHA-256 hash
+of the signed token (`token_hash`), an `expires_at` (30 days after
+`Appointment.end_datetime`), and a nullable `cancelled_via_token_at`. Frontend JS reads
+`window.location.hash` and sends the token to the API as an `X-Guest-Token` header on
+view/cancel requests; the API re-hashes the presented token, looks it up by
+`token_hash`, and checks `expires_at`. Viewing only requires a valid, unexpired token;
+cancelling additionally sets `cancelled_via_token_at`, which is checked independently
+of expiry — a cancelled appointment stays viewable through the same link.
 
 **Guest → registered linking.** Only triggered after the `User`'s email is verified
 (per `docs/DECISIONS.md` — never by phone). On verification, every `Customer` row
