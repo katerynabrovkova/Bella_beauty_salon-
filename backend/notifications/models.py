@@ -60,8 +60,10 @@ class Notification(TenantScopedModel, TimeStamped):
     )
     sent_at = models.DateTimeField(null=True, blank=True)
 
-    class Meta:
+    class Meta(TenantScopedModel.Meta):
+        abstract = False
         constraints = [
+            *TenantScopedModel.Meta.constraints,
             models.UniqueConstraint(
                 fields=["trigger_type", "channel", "dedup_key"],
                 name="notification_trigger_channel_dedup_uniq",

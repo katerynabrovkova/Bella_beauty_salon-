@@ -11,7 +11,9 @@ class ServiceCategory(TenantScopedModel, TimeStamped):
         abstract = False
         constraints = [
             *TenantScopedModel.Meta.constraints,
-            models.UniqueConstraint(fields=["salon", "name"], name="servicecategory_salon_name_uniq"),
+            models.UniqueConstraint(
+                fields=["salon", "name"], name="servicecategory_salon_name_uniq"
+            ),
         ]
         ordering = ["ordering", "name"]
 

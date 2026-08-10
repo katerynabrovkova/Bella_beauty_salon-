@@ -23,7 +23,9 @@ class SalonStaff(TenantScopedModel, TimeStamped):
     """A back-office login: User x Salon with a role (docs/ARCHITECTURE.md § 4)."""
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    role = models.CharField(max_length=32, choices=SalonStaffRole.choices, default=SalonStaffRole.ADMIN)
+    role = models.CharField(
+        max_length=32, choices=SalonStaffRole.choices, default=SalonStaffRole.ADMIN
+    )
 
     class Meta(TenantScopedModel.Meta):
         abstract = False

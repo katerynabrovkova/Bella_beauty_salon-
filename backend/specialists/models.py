@@ -8,7 +8,9 @@ class Specialist(TenantScopedModel, TimeStamped):
     name = models.CharField(max_length=255)
     bio = models.TextField(blank=True)
 
-    services = models.ManyToManyField(Service, through="SpecialistService", related_name="specialists")
+    services: "models.ManyToManyField[Service, SpecialistService]" = models.ManyToManyField(
+        Service, through="SpecialistService", related_name="specialists"
+    )
 
     def __str__(self) -> str:
         return self.name
@@ -47,7 +49,9 @@ class DayOfWeek(models.IntegerChoices):
 class WorkingHours(TenantScopedModel, TimeStamped):
     """Recurring weekly template. Multiple rows per day are allowed (split shifts)."""
 
-    specialist = models.ForeignKey(Specialist, on_delete=models.CASCADE, related_name="working_hours")
+    specialist = models.ForeignKey(
+        Specialist, on_delete=models.CASCADE, related_name="working_hours"
+    )
     day_of_week = models.IntegerField(choices=DayOfWeek.choices)
     start_time = models.TimeField()
     end_time = models.TimeField()

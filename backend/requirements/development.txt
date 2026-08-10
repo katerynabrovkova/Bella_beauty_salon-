@@ -3,7 +3,6 @@
 pytest==9.1.1
 pytest-django==4.13.0
 ruff==0.16.2
-black==26.5.1
 # Capped by django-stubs' compatible-mypy extra: mypy<1.20,>=1.13
 # as of django-stubs 5.2.9. mypy 2.x is NOT yet supported.
 mypy==1.19.1

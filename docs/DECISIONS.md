@@ -252,3 +252,16 @@ they are stated once, not duplicated.
   availability engine (Stage 6) walks a specialist's open windows in when
   generating candidate start times. Salon-configurable, like the lead-time and
   advance-window defaults above.
+
+## Formatting/linting tooling
+
+- **Consolidated on `ruff format`, dropped `black`.** Stage 0 originally pinned both;
+  no reason for running two formatters was ever recorded, and by Stage 2 `ruff format`
+  had matured into a deliberately black-compatible formatter (~99.9% identical output),
+  making the second tool redundant. Removed `black` from
+  `backend/requirements/development.txt`; `[tool.black]` dropped from `pyproject.toml`
+  (`ruff format` reads the existing `line-length`/`target-version` from `[tool.ruff]`).
+  Checked at a point where the codebase had almost no formatted history yet, so the risk
+  from any one-time reformat diff was effectively zero — revisit only if a future need for
+  byte-for-byte black compatibility (e.g. an external tool that assumes black output)
+  comes up.

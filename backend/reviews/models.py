@@ -19,8 +19,10 @@ class Review(TenantScopedModel, TimeStamped):
     text = models.TextField(blank=True)
     hidden_at = models.DateTimeField(null=True, blank=True)
 
-    class Meta:
+    class Meta(TenantScopedModel.Meta):
+        abstract = False
         constraints = [
+            *TenantScopedModel.Meta.constraints,
             models.CheckConstraint(
                 condition=models.Q(rating__gte=1) & models.Q(rating__lte=5),
                 name="review_rating_between_1_and_5",

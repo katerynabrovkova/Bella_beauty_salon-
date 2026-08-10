@@ -76,7 +76,7 @@ salons without rework.
 ## Coding conventions
 
 - Type hints throughout; `mypy` (with `django-stubs`) must pass.
-- Formatting/linting: `black` and `ruff`, both configured in `backend/pyproject.toml`.
+- Formatting/linting: `ruff` (lint + format), configured in `backend/pyproject.toml`.
 - Tests: `pytest` + `pytest-django`, against a real PostgreSQL instance.
 
 ## Running the project
@@ -119,6 +119,6 @@ docker compose exec backend python manage.py createsuperuser
 ```bash
 docker compose exec backend pytest
 docker compose exec backend ruff check .
-docker compose exec backend black --check .
+docker compose exec backend ruff format --check .
 docker compose exec backend mypy .
 ```

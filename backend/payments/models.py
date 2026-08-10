@@ -21,9 +21,13 @@ class Payment(TenantScopedModel, TimeStamped):
     separately from Appointment.status. One deposit payment per appointment.
     """
 
-    appointment = models.OneToOneField(Appointment, on_delete=models.PROTECT, related_name="payment")
+    appointment = models.OneToOneField(
+        Appointment, on_delete=models.PROTECT, related_name="payment"
+    )
     amount = models.DecimalField(max_digits=10, decimal_places=2)
-    status = models.CharField(max_length=32, choices=PaymentStatus.choices, default=PaymentStatus.PENDING)
+    status = models.CharField(
+        max_length=32, choices=PaymentStatus.choices, default=PaymentStatus.PENDING
+    )
     provider_reference_id = models.CharField(max_length=255, blank=True, db_index=True)
 
     def __str__(self) -> str:

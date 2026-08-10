@@ -48,7 +48,14 @@ class TenantScopedModel(models.Model):
     )
 
     objects = TenantScopedManager()
-    unscoped_objects = models.Manager()
+    # ruff (DJ012) misreads this as "manager after field" because it doesn't
+    # recognize TenantScopedManager as a manager until it's seen a plain
+    # models.Manager() first. Do not reorder these two: Django treats the
+    # *first* manager declared as the model's default manager regardless of
+    # its name, so putting unscoped_objects first would make the unfiltered
+    # manager the one Django uses internally (reverse relations, admin,
+    # etc.), silently defeating tenant isolation.
+    unscoped_objects = models.Manager()  # noqa: DJ012
 
     class Meta:
         abstract = True

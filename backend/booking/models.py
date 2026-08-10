@@ -35,7 +35,9 @@ class Appointment(TenantScopedModel, TimeStamped):
     """
 
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="appointments")
-    specialist = models.ForeignKey(Specialist, on_delete=models.PROTECT, related_name="appointments")
+    specialist = models.ForeignKey(
+        Specialist, on_delete=models.PROTECT, related_name="appointments"
+    )
     service = models.ForeignKey(Service, on_delete=models.PROTECT, related_name="appointments")
 
     start_datetime = models.DateTimeField()
@@ -58,15 +60,19 @@ class Appointment(TenantScopedModel, TimeStamped):
     )
 
     cancelled_at = models.DateTimeField(null=True, blank=True)
-    cancelled_by = models.CharField(max_length=16, choices=CancelledBy.choices, null=True, blank=True)
+    cancelled_by = models.CharField(
+        max_length=16, choices=CancelledBy.choices, null=True, blank=True
+    )
     cancellation_reason = models.TextField(blank=True)
 
-    class Meta:
+    class Meta(TenantScopedModel.Meta):
+        abstract = False
         indexes = [
             models.Index(fields=["specialist", "start_datetime"], name="appt_specialist_start_idx"),
             models.Index(fields=["salon", "status"], name="appointment_salon_status_idx"),
         ]
         constraints = [
+            *TenantScopedModel.Meta.constraints,
             models.CheckConstraint(
                 condition=models.Q(start_datetime__lt=models.F("end_datetime")),
                 name="appointment_start_before_end",

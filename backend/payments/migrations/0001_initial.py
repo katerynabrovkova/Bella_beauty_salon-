@@ -3,9 +3,10 @@
 import django.db.models.deletion
 from django.db import migrations, models
 
+from core.db import composite_tenant_fk
+
 
 class Migration(migrations.Migration):
-
     initial = True
 
     dependencies = [
@@ -85,5 +86,11 @@ class Migration(migrations.Migration):
                     )
                 ],
             },
+        ),
+        composite_tenant_fk(
+            child_table="payments_payment",
+            fk_column="appointment_id",
+            parent_table="booking_appointment",
+            constraint_name="payments_payment_appointment_composite_fk",
         ),
     ]
