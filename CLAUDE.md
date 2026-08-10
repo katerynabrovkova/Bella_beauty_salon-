@@ -62,6 +62,12 @@ salons without rework.
 - Multi-tenancy is shared-database/shared-schema with row-level isolation: every tenant-owned
   model carries a `salon` FK, enforced through a shared base manager/queryset — never rely on
   each view remembering to filter by tenant.
+- On every `TenantScopedModel` subclass, `objects` must be declared before `unscoped_objects`.
+  Django treats the first manager declared in a model body as its default manager regardless of
+  name; reordering would silently make the unfiltered `unscoped_objects` manager the default,
+  defeating tenant isolation wherever Django uses the default manager internally (reverse
+  relations, admin, etc.). ruff's DJ012 actively suggests this reorder as a style fix — the
+  `# noqa: DJ012` on `unscoped_objects` in `core/models.py` is deliberate; do not "fix" it.
 - `Appointment` always references `Customer`, never `User` directly — see `docs/DECISIONS.md`
   for the guest/registered customer model.
 - Business logic (availability computation, cancellation/refund eligibility, booking
