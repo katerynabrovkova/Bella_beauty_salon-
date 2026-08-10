@@ -110,8 +110,8 @@ for its own sake — see § 5 for why.
 
 Two separate identity tracks, per `docs/DECISIONS.md` § Identity:
 
-**Registered users (`User`).** Standard email + password, issued JWTs (DRF
-SimpleJWT — planned per `CLAUDE.md`, added when this app lands). Used for both
+**Registered users (`User`).** Standard email + password, issued JWTs via DRF
+SimpleJWT (`TokenObtainPairView`/refresh/logout, landed in Stage 3). Used for both
 customers who choose to register and for salon staff.
 
 **Guests (`Customer` with `user=NULL`).** No login at all. At booking time, the
@@ -178,7 +178,9 @@ path-prefix resolution):
 - `core.TenantScopedManager` / `QuerySet` — the model's **default** manager
   (`objects`). It reads the current tenant from a context variable set by the
   resolution middleware for the duration of the request and auto-filters every query
-  against it. If no tenant context is bound, `objects` **raises** rather than
+  against it. The resolution middleware is last in `MIDDLEWARE`, so the tenant
+  context is bound only around the view, not around any other middleware's
+  request/response processing. If no tenant context is bound, `objects` **raises** rather than
   returning an unfiltered queryset — there is no silent "all tenants" default.
   Deliberately bypassing scoping (Django admin, platform-level tooling, Celery tasks
   that operate across salons) requires calling `Model.unscoped_objects` — a
@@ -340,20 +342,23 @@ method, one adapter per channel.
 
 **Trigger points:** booking confirmed, booking cancelled, appointment reminder
 (scheduled, § 12), payment succeeded/failed, review request after an appointment
-completes, **guest→User email verification** (§ 3) — not appointment-scoped at all,
-routed through the same channel abstraction rather than a separate ad hoc email path,
-so verification mail gets the same dedup/idempotency guarantee as everything else
-instead of being a special case that's easy to forget.
+completes. **Guest→User email verification and password reset** (§ 3) are not
+routed through this abstraction for Stage 3 — they're sent by a standalone Celery
+task in `accounts/tasks.py` (plain `django.core.mail.send_mail`), with none of the
+dedup/idempotency machinery below. Routing them through `Notification` is deferred
+to Stage 9: `Notification.salon` is non-nullable, and verification/reset are
+salon-less `User` events.
 
 **Duplicate-send prevention** uses the same idempotency shape as § 8: a `Notification`
 row is created in `PENDING` status *before* any send is attempted. `Notification.
-appointment` is **nullable** — verification email has no appointment to hang off —
-so the dedup natural key can't be `(trigger type, appointment id, channel)` as
-originally stated: a nullable column doesn't enforce uniqueness in Postgres (multiple
-`NULL`s never collide). Instead the unique constraint is on `(trigger type, channel,
-dedup_key)`, where `dedup_key` is a plain string the caller populates —
-`f"appointment:{id}"` for appointment-scoped triggers, `f"user:{id}"` for
-verification email — so every trigger type has an explicit, always-populated
+appointment` is **nullable** — a salon-less trigger (e.g. a future, Stage-9-routed
+verification email) would have no appointment to hang off — so the dedup natural key
+can't be `(trigger type, appointment id, channel)` as originally stated: a nullable
+column doesn't enforce uniqueness in Postgres (multiple `NULL`s never collide).
+Instead the unique constraint is on `(trigger type, channel, dedup_key)`, where
+`dedup_key` is a plain string the caller populates — `f"appointment:{id}"` for the
+appointment-scoped triggers this app currently handles — so every trigger type has
+an explicit, always-populated
 collision key regardless of what it's actually about. The sending task only
 transitions `PENDING → SENT` under that row's lock, so a retried Celery task or a
 duplicate trigger (e.g. a webhook firing twice) cannot produce two emails for the same
