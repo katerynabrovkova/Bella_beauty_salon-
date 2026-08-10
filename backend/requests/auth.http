@@ -136,5 +136,5 @@ POST {{baseUrl}}/api/v1/auth/verify-email/
 Content-Type: application/json
 
 {
-  "token": "eyJ1c2VyX2lkIjozLCJlbWFpbCI6Imh0dHAtZmlsZS1jaGVja0BleGFtcGxlLmNvbSJ9:1wtOS5:2gnH4ex0VFoDJHunuezlOSTcgiaS7L-Te_Ptq4drTMI"
+  "token": "PASTE_TOKEN_FROM_EMAIL"
 }
