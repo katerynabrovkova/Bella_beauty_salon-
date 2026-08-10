@@ -447,3 +447,72 @@ they are stated once, not duplicated.
   cancellation service layer remain Stage 8 and Stage 7 work respectively; this only
   flips the appointment's own status, with a comment marking where Stage 8's refund
   hook goes.
+
+## Stage 3 sub-step 4 decisions (Django admin, Stage 3 cleanup)
+
+- **`core.admin.SalonScopedAdmin` is a deliberate, blanket cross-tenant tool for
+  platform operators, not a per-salon back office.** Every salon's data is visible
+  together in `/admin/` by design — that's Django `is_staff`/`is_superuser` territory
+  (`docs/ARCHITECTURE.md` § 4's "Platform superuser" role), not the product back
+  office, which is Stages 18–21, built on the JWT + `IsSalonStaff` API surface
+  instead. It overrides `get_queryset` (list views) to read through
+  `unscoped_objects`, since admin requests never bind tenant context the way
+  `/api/v1/salons/<slug>/...` requests do. It also overrides
+  `formfield_for_foreignkey`, which turned out to need more than just supplying a
+  `queryset` kwarg: Django's `ForeignKey.formfield()` unconditionally evaluates the
+  related model's `_default_manager` while building its own `defaults` dict, *before*
+  applying any `queryset` override passed in — so opening the add/change form for a
+  model with a FK to another `TenantScopedModel` (e.g. `Service` → `ServiceCategory`)
+  still 500s unless *something* is bound. The fix binds a throwaway sentinel tenant
+  (`tenant_context(-1)`) around that one call — the eagerly-computed queryset it
+  produces is immediately discarded in favor of the real `unscoped_objects` one, so
+  which id is bound doesn't matter, only that one is. Found by a test
+  (`test_service_add_form_renders_without_a_bound_tenant`) that actually opened the
+  form rather than only checking the changelist.
+- **`GuestAccessToken` is registered, read-only.** `token_hash` is a SHA-256 hash, not
+  the raw token — the entire reason it's hashed (this file, Stage 3 sub-step 3
+  decisions) is that knowing the hash doesn't grant access, so showing it to an
+  authorized platform operator isn't equivalent to leaking a working link, and it has
+  real support value (did this guest's link get used? when does it expire?).
+  Read-only because rows are only ever meant to come from `issue_guest_token` — an
+  admin-typed `token_hash` wouldn't correspond to any real signed token.
+  `token_hash` is left out of `list_display`, and — found only by writing a test that
+  actually loaded the change page rather than reasoning about it — was still rendered
+  on the change/detail form regardless, since with no `fields`/`exclude` set Django's
+  default `ModelAdmin` includes every model field on that page no matter what
+  `list_display` says, and `has_change_permission=False` only disables editing, not
+  visibility. Now excluded explicitly (`exclude = ("token_hash",)`), with
+  `tests/test_admin_tenant_scoping.py::test_guest_access_token_change_view_does_not_render_token_hash`
+  guarding the regression.
+- **Read-only models: `Appointment`, `Payment`, `Notification`, `ProcessedWebhookEvent`,
+  `GuestAccessToken`, `Review`.** `Appointment` and `Payment` each carry a `status`
+  field driven by a service layer that doesn't exist yet (booking core is Stage 7,
+  payments Stage 8) — made the *whole* model read-only rather than only `status`,
+  since the other fields (`cancelled_by`, the price/deposit snapshots,
+  `hold_expires_at`) are just as capable of corrupting invariants that layer will
+  assume hold, and there's no legitimate hand-edit case before it exists.
+  `Notification.status` drives Stage 9's dedup/idempotency machinery the same way.
+  `ProcessedWebhookEvent` is a pure idempotency ledger with no legitimate hand-edit
+  case, kept read-only for debugging visibility only — not a `TenantScopedModel` (no
+  `salon` field, arrives before salon is known), so it uses `ReadOnlyAdminMixin`
+  directly rather than `ReadOnlySalonScopedAdmin`. `Review` is the one case where the
+  reasoning is stronger than "not built yet": reviews are explicitly **immutable once
+  posted** (this file, § Business rules), so admin edit would directly violate that
+  rule, not just get ahead of an unbuilt stage. `hidden_at` is the one sanctioned
+  staff mutation, but its real UI is Stage 21 — deferred rather than building
+  partial-field editability now. Editable: `SalonStaff`, `Customer` (support/operator
+  tooling this surface exists for), `ServiceCategory`, `Service`, `Specialist`,
+  `SpecialistService`, `WorkingHours`, `TimeOff`, `Salon` — reference/config data with
+  no not-yet-built state machine underneath any of it.
+- **Cross-tenant FK mismatch via admin (e.g. a `Service` saved with `salon`=A but
+  `category` from salon B) is already closed at the database layer — no new
+  application-level guard added.** `salon` stays a visible, explicitly-chosen field on
+  every add/change form; there's no ambient tenant context to silently get wrong. Every
+  `TenantScopedModel` with a second tenant-scoped FK already has a DB-level composite
+  FK (`core/db.py`'s `composite_tenant_fk`, 14 call sites across migrations, enforcing
+  `(child.fk_id, child.salon_id) -> (parent.id, parent.salon_id)`, tested since Stage 2
+  commit `fb3605e`) — a mismatched submission fails as an `IntegrityError` at the
+  database, not a silent cross-tenant link. That's an ugly generic-500 failure mode for
+  an internal tool, not a correctness gap. Deliberately not adding admin-form
+  `clean()`-level cross-validation to turn it into a friendlier message — that's UX
+  polish beyond this sub-step, revisit only if a real operator workflow needs it.

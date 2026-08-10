@@ -1,9 +1,11 @@
 """
 The tenant-context mechanism that makes an unscoped query the hard path.
 
-See docs/ARCHITECTURE.md § 5. No HTTP middleware binds this yet — that lands
-in Stage 3. Until then, callers (tests, Stage 2 code, later Celery tasks) bind
-the context explicitly via `tenant_context`.
+See docs/ARCHITECTURE.md § 5. `tenants.middleware.TenantResolutionMiddleware`
+binds this for requests under /api/v1/salons/<slug>/... (Stage 3); everything
+else — tests, Celery tasks, and Django admin (core.admin) — binds it
+explicitly via `tenant_context`, or bypasses it deliberately via
+`Model.unscoped_objects`.
 """
 
 from collections.abc import Iterator

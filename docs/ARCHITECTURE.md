@@ -161,8 +161,11 @@ Permission classes (DRF, added when the API lands):
   the resolved tenant (§ 5), optionally restricted to specific roles.
 - `IsOwnCustomer` — object-level check that the acting `Customer` (from the JWT or
   a validated guest token) matches the object's `customer` FK.
-- `HasValidGuestToken` — validates the signed token from § 3 against the object it's
-  scoped to.
+- `HasValidGuestToken` — validates the signed token from § 3 in `has_permission` (not
+  `has_object_permission`, so the check runs regardless of view shape — see
+  `CLAUDE.md`'s "DRF object-level permissions" rule); the target object is then
+  resolved *from* the validated token, never validated against a separately-sourced
+  (e.g. URL-supplied) id.
 
 These are a second line of defense on writes; the tenant-scoped manager (§ 5) is the
 first line, so a missing permission check fails toward "wrong data invisible," not
@@ -186,7 +189,11 @@ path-prefix resolution):
   that operate across salons) requires calling `Model.unscoped_objects` — a
   differently-named, greppable manager — never a flag or kwarg on `objects` itself.
   A one-word manager name that shows up in a repo-wide search is the point: nobody
-  reaches for it by accident.
+  reaches for it by accident. `core.admin.SalonScopedAdmin` is the concrete Django
+  admin implementation of this: it overrides `get_queryset` (list views) and
+  `formfield_for_foreignkey` (add/change form FK dropdowns onto another tenant-scoped
+  model) to route through `unscoped_objects`, since admin requests never bind tenant
+  context the way `/api/v1/salons/<slug>/...` requests do.
 - **Celery tasks have no request, so no middleware.** Any task that touches
   tenant-scoped models must explicitly bind the tenant context at the top of the
   task (e.g. a `@tenant_context(salon_id)` decorator wrapping the context-var
