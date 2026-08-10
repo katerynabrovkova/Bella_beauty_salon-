@@ -6,6 +6,7 @@ that varies between local/CI/production comes from the environment. See
 docs/DECISIONS.md before changing anything here.
 """
 
+import datetime as dt
 from pathlib import Path
 
 import environ
@@ -32,6 +33,9 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "django.contrib.postgres",
+    "rest_framework",
+    "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "core",
     "tenants",
     "accounts",
@@ -113,3 +117,79 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+
+# --- Cache (DRF throttling) -------------------------------------------------
+#
+# DRF's throttle classes count requests through the Django cache. A separate
+# Redis logical DB from the Celery broker (0) and result backend (1) —
+# docs/DECISIONS.md § Stage 3 decisions — to keep throttle keys from ever
+# colliding with Celery's own. LocMemCache (the Django default when CACHES is
+# unset) is per-process: behind multiple gunicorn/uvicorn workers, each one
+# would keep its own counter and the effective rate limit becomes
+# (configured rate × worker count), silently.
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": env("REDIS_CACHE_URL"),
+    }
+}
+
+# --- DRF / JWT ---------------------------------------------------------------
+
+REST_FRAMEWORK = {
+    # Fail closed: a future view that forgets its permission class requires
+    # auth by default rather than being silently open (docs/DECISIONS.md §
+    # Stage 3 decisions). Auth endpoints opt out individually with AllowAny.
+    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ],
+    "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.ScopedRateThrottle"],
+    # Rates and reasoning recorded in docs/DECISIONS.md § Stage 3 decisions.
+    # guest_token is predeclared for the Stage 3 sub-step that adds the
+    # endpoint it applies to; unused until then.
+    "DEFAULT_THROTTLE_RATES": {
+        "login": "5/min",
+        "password_reset": "3/hour",
+        "resend_verification": "3/hour",
+        "guest_token": "20/min",
+    },
+    "EXCEPTION_HANDLER": "core.exceptions.exception_handler",
+}
+
+SIMPLE_JWT = {
+    # 15 min access / 7 day refresh, rotating with blacklist-after-rotation:
+    # a stolen refresh token is single-use, dead the moment the legitimate
+    # client rotates it. docs/DECISIONS.md § Stage 3 decisions.
+    "ACCESS_TOKEN_LIFETIME": dt.timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": dt.timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "UPDATE_LAST_LOGIN": True,
+}
+
+# --- Email -------------------------------------------------------------------
+
+EMAIL_BACKEND = env("EMAIL_BACKEND", default="django.core.mail.backends.smtp.EmailBackend")
+EMAIL_HOST = env("EMAIL_HOST", default="localhost")
+EMAIL_PORT = env.int("EMAIL_PORT", default=25)
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
+EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=False)
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="no-reply@bella-beauty-salon.example")
+
+# Base URL of the (not-yet-built, see docs/DECISIONS.md § Frontend cadence)
+# frontend, used only to build clickable links in outgoing email. The token
+# itself travels in the URL fragment, never a query string — see
+# docs/DECISIONS.md § Stage 3 decisions (guest token transport; the same
+# reasoning applies to every emailed token, not only the guest one).
+FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000")
+
+# Django's own token generator (used for password reset) reads this directly.
+# Short relative to email verification's 48h: a live reset token is the
+# highest-value credential in this scheme and is normally acted on within
+# minutes of being requested (docs/DECISIONS.md § Stage 3 decisions).
+PASSWORD_RESET_TIMEOUT = 60 * 60  # 1 hour
+
+# Email verification token expiry (accounts.tokens), read by that module.
+EMAIL_VERIFICATION_TIMEOUT = 60 * 60 * 48  # 48 hours

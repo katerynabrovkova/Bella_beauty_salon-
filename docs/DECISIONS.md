@@ -318,3 +318,61 @@ they are stated once, not duplicated.
   diverge on that branch. On a duplicate registration email, a "you already have an
   account" notice is sent instead of creating a second row — the caller-visible
   response is the same either way.
+- **DRF throttling requires a shared cache, not the default `LocMemCache`.** DRF's
+  throttle classes count requests through the Django cache; `LocMemCache` (the default
+  when `CACHES` is unset — true of this project until Stage 3) is per-process, so
+  behind N gunicorn/uvicorn workers the effective limit becomes `rate × N`, silently.
+  Fixed with Django's built-in `django.core.cache.backends.redis.RedisCache` (no new
+  dependency — uses the already-pinned `redis` package), pointed at Redis logical **DB
+  2** via `REDIS_CACHE_URL`, kept separate from the Celery broker (DB 0) and result
+  backend (DB 1) so throttle keys can never collide with Celery's own.
+- **Email verification does not route through the `Notification`/channel abstraction
+  described in `docs/ARCHITECTURE.md` § 9, for Stage 3.** `Notification` extends
+  `TenantScopedModel`, whose `salon` FK is non-nullable — but registration/email
+  verification is a platform-wide `User` event with no salon in scope
+  (`/api/v1/auth/...` is explicitly outside the salon prefix, § 13). Reconciling that
+  (nullable `salon` on `Notification`, or a different representation for
+  salon-less triggers) is Stage 9 (Celery + notifications) work, not Stage 3 — recorded
+  here as a known gap rather than silently worked around. Stage 3 sends these emails
+  via a small standalone Celery task in `accounts/tasks.py` (plain
+  `django.core.mail.send_mail`), with none of the dedup/idempotency machinery
+  `Notification` provides — acceptable for now because both underlying operations
+  (marking an email verified, requesting a password reset) are themselves idempotent,
+  so a duplicate send is a minor annoyance, not a correctness bug.
+- **Email verification token: stateless, not single-use, payload includes the target
+  email.** `TimestampSigner`-signed `{"user_id", "email"}`, 48h expiry
+  (`EMAIL_VERIFICATION_TIMEOUT`). Verifying is idempotent (setting
+  `email_verified_at` twice is a no-op), unlike the guest token's *cancel* action,
+  which has a real one-time consequence — that asymmetry is why the guest token needs
+  a stored single-use record and this one doesn't. Including the target email in the
+  signed payload, checked against the user's *current* `email` at verify time, means a
+  future "change email" feature gets automatic invalidation of old tokens for free —
+  no separate revocation step needed, since a changed email simply stops matching.
+- **Password reset uses Django's built-in `PasswordResetTokenGenerator`**, not a
+  hand-rolled signer — it's already self-invalidating on password change (the hash it
+  produces incorporates the current password hash), which is exactly the single-use
+  property this token needs and the verification token doesn't.
+  `PASSWORD_RESET_TIMEOUT` is set to 1 hour, tighter than email verification's 48h,
+  since a live reset token is the highest-value credential in this scheme and is
+  normally acted on within minutes of being requested.
+- **`User.username` is dropped; `email` (unique) is `USERNAME_FIELD`, with a custom
+  `UserManager`.** Record of how this actually happened, not just what changed:
+  - **Not required by JWT.** `djangorestframework-simplejwt` is fully agnostic to
+    `USERNAME_FIELD` — `TokenObtainPairView` authenticates against whatever field
+    `USERNAME_FIELD` names, `username` included, with zero changes needed on its side.
+    Nothing about adding JWT auth forced this.
+  - **A less invasive alternative existed and wasn't raised at the time:** keep
+    `username` as `AbstractUser` shipped it, add a non-unique `email`, and leave login
+    on `username` for Stage 3, deferring "email is the login identity" until it was
+    actually load-bearing.
+  - **What actually happened:** while implementing Stage 3 sub-step 2, this was
+    inferred from `docs/ARCHITECTURE.md` § 3's product-level phrase "standard email +
+    password" and written directly into `accounts/models.py` — `username = None`,
+    `email` made unique, `USERNAME_FIELD` changed, a new `UserManager` added — without
+    surfacing it as a decision first. It was only written up here, in this file,
+    *after* the diff already existed, which inverted this file's purpose: it is meant
+    to record what was agreed, not to notarize a change after the fact.
+  - **Resolution:** the user reviewed the diff, agreed with the outcome (email as
+    `USERNAME_FIELD` is right for this product) but not the process, and approved it
+    after the fact. The rule this produced — model/manager/migration changes of this
+    kind must be raised and approved *before* implementation — is now in `CLAUDE.md`.

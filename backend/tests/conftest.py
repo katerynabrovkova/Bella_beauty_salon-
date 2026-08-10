@@ -1,6 +1,7 @@
 import datetime as dt
 
 import pytest
+from django.core.cache import cache
 
 from accounts.models import Customer
 from booking.models import Appointment, AppointmentStatus
@@ -8,6 +9,29 @@ from catalog.models import Service, ServiceCategory
 from core.tenancy import tenant_context
 from specialists.models import Specialist
 from tenants.models import Salon
+
+
+@pytest.fixture(autouse=True)
+def _celery_eager(settings):
+    """
+    Runs @shared_task calls inline instead of dispatching to a real worker —
+    .delay()/.apply_async() still go through Celery's own machinery, so this
+    doesn't hide a view that forgot to enqueue at all (docs/DECISIONS.md §
+    Stage 3 decisions). Combined with pytest-django's automatic EMAIL_BACKEND
+    override to locmem, sent mail lands in django.core.mail.outbox.
+    """
+    settings.CELERY_TASK_ALWAYS_EAGER = True
+    settings.CELERY_TASK_EAGER_PROPAGATES = True
+
+
+@pytest.fixture(autouse=True)
+def _clear_cache():
+    """DRF throttling counts requests in the Django cache (real Redis here,
+    same as dev/prod) — clear it so one test's throttle counter can't leak
+    into the next."""
+    cache.clear()
+    yield
+    cache.clear()
 
 
 @pytest.fixture

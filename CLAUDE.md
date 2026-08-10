@@ -7,6 +7,19 @@ abstractions, or anything else that isn't a local implementation detail — read
 `docs/DECISIONS.md` first.** It is the source of truth for *why* the system is shaped the way
 it is. If you make a new architectural decision, record it there in the same change.
 
+**`docs/DECISIONS.md` records what was agreed, not what you concluded.** Never write an
+entry there to notarize a change you already made — if a decision needed approval and
+didn't get it first, the write-up must say so plainly (what changed, what alternative
+existed, that approval came after the fact), not read as if it were agreed in advance.
+
+**The following require an explicit decision point, raised and approved *before* you
+write the change, never folded into a diff for later review:** any change to
+`AUTH_USER_MODEL` or its shape, any change to a model's `Meta` (constraints, ordering,
+managers), any change to which manager is default/first-declared, and any migration
+containing `RemoveField`, `AlterField`, or `DeleteModel`. Generating the migration to see
+what it contains is fine; applying it, or writing the model change that produces it,
+is not, until approved.
+
 ## Stage-by-stage workflow
 
 This project is built one stage at a time, in the order recorded in
