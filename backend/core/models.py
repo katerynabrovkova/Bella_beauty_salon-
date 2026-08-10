@@ -1,6 +1,10 @@
+from typing import TypeVar
+
 from django.db import models
 
 from core.tenancy import TenantContextMissingError, get_current_salon_id
+
+_M = TypeVar("_M", bound="TenantScopedModel")
 
 
 class TimeStamped(models.Model):
@@ -11,20 +15,25 @@ class TimeStamped(models.Model):
         abstract = True
 
 
-class TenantScopedQuerySet(models.QuerySet["TenantScopedModel"]):
+class TenantScopedQuerySet(models.QuerySet[_M]):
     pass
 
 
-class TenantScopedManager(models.Manager["TenantScopedModel"]):
+class TenantScopedManager(models.Manager[_M]):
     """
     Default manager for every tenant-owned model. Auto-filters to the
     currently bound tenant (core.tenancy) and raises if none is bound —
     there is no silent "all tenants" fallback. Deliberate bypass is
     `Model.unscoped_objects`, a differently named plain manager (see
     docs/ARCHITECTURE.md § 5).
+
+    Generic over `_M` (not hardcoded to `TenantScopedModel`) so django-stubs
+    resolves `SomeConcreteModel.objects.filter(...)` against that concrete
+    model's own fields, not just the abstract base's — otherwise every
+    subclass's manager would type-check as if it only had `salon`/`id`.
     """
 
-    def get_queryset(self) -> TenantScopedQuerySet:
+    def get_queryset(self) -> TenantScopedQuerySet[_M]:
         salon_id = get_current_salon_id()
         if salon_id is None:
             raise TenantContextMissingError(
