@@ -7,10 +7,19 @@ from core.models import TenantScopedModel, TimeStamped
 class Specialist(TenantScopedModel, TimeStamped):
     name = models.CharField(max_length=255)
     bio = models.TextField(blank=True)
+    # Employment status only: True = currently employed, False = no longer
+    # employed. Not a general availability/visibility flag — temporary
+    # absence (vacation, sick leave, parental leave) is TimeOff rows, never
+    # a status here (docs/DECISIONS.md § Stage 5 decisions).
+    is_active = models.BooleanField(default=True)
 
     services: "models.ManyToManyField[Service, SpecialistService]" = models.ManyToManyField(
         Service, through="SpecialistService", related_name="specialists"
     )
+
+    class Meta(TenantScopedModel.Meta):
+        abstract = False
+        ordering = ["name", "id"]
 
     def __str__(self) -> str:
         return self.name
