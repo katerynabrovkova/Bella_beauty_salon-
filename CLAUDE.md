@@ -12,6 +12,18 @@ entry there to notarize a change you already made — if a decision needed appro
 didn't get it first, the write-up must say so plainly (what changed, what alternative
 existed, that approval came after the fact), not read as if it were agreed in advance.
 
+**The two docs split along "what" vs. "why," not by topic.** `docs/ARCHITECTURE.md`
+describes what this system is — domain entities, mechanisms, invariants — and stays at
+that level even as later stages land; `docs/DECISIONS.md` carries why a given shape was
+chosen, including the concrete detail that never makes it into `ARCHITECTURE.md` at all:
+endpoint lists, permission-class splits, specific exception classes, and alternatives
+that were considered and rejected. Catalog is the precedent: its CRUD endpoints, the
+`AllowAny`/`IsSalonStaff` read/write split, and `CategoryHasActiveServicesError` appear
+only in `docs/DECISIONS.md` § Stage 4 decisions, never in `ARCHITECTURE.md`. Don't add
+that level of detail to `ARCHITECTURE.md` for a later stage just because it feels like
+it belongs there — matching precedent avoids an asymmetry that would mislead whoever
+reads it next expecting the same split to hold.
+
 **The following require an explicit decision point, raised and approved *before* you
 write the change, never folded into a diff for later review:** any change to
 `AUTH_USER_MODEL` or its shape, any change to a model's `Meta` (constraints, ordering,
@@ -193,6 +205,29 @@ Run Django management commands inside the `backend` container, e.g.:
 docker compose exec backend python manage.py migrate
 docker compose exec backend python manage.py createsuperuser
 ```
+
+### Windows / PowerShell notes
+
+Environment traps hit while working on this repo from a Windows/PowerShell host —
+recorded so they aren't rediscovered stage by stage:
+
+- **Unix-style commands are not portable in this shell.** `find / -name "x.py"` walks
+  the entire filesystem and hangs indefinitely; it left a stray background process
+  running for three turns during Stage 5. Locate files via `git`, ripgrep, or a known
+  path instead.
+- **`curl` is a PowerShell alias for `Invoke-WebRequest`, not real curl.** Use
+  `curl.exe` to get actual curl behavior.
+- **Multi-line `git commit -m "line1\nline2"` does not work** — the remaining lines
+  after the first execute as separate shell commands. Use several separate `-m` flags
+  instead, one per paragraph.
+- **Run every `manage.py` command inside the container**
+  (`docker compose exec backend ...`), never from the host venv — even for commands
+  that don't touch the database (e.g. `makemigrations`). The host venv's Django exists
+  for the IDE's benefit, not for running this project, and its version isn't
+  guaranteed to match the container's.
+- **Never assume the host port.** `HOST_BACKEND_PORT` is per-developer and is not
+  `8000` on every machine — read it from `.env`, or reach the backend from inside the
+  Docker network at `backend:8000`, where the port never varies.
 
 ## Running tests and linters
 
