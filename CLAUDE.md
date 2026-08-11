@@ -55,8 +55,9 @@ salons without rework.
 ## Tech stack
 
 - **Backend:** Python, Django, PostgreSQL, Celery + Redis, pytest — wired up as of Stage 0.
-  Django REST Framework, JWT auth, and OpenAPI/Swagger are part of the plan but **not yet
-  added** (land with the stages that need them, per `docs/DECISIONS.md`'s stage order). Exact
+  Django REST Framework and JWT auth (DRF SimpleJWT) landed in Stage 3. OpenAPI/Swagger is
+  still part of the plan but **not yet added** (lands with the stage that needs it, per
+  `docs/DECISIONS.md`'s stage order). Exact
   versions live in `backend/requirements/*.txt`, not here — that file is the source of truth
   and this one will drift if it restates numbers. Version-compatibility reasoning (LTS choice,
   why some packages are deliberately not pinned to their newest release) lives in

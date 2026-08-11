@@ -19,9 +19,9 @@ references "Stage N," it refers to this list — keep those references in
 sync if the order ever changes.
 
 0. Scaffolding (done)
-1. Detailed backend architecture, written to `docs/ARCHITECTURE.md`, no code
-2. Domain models + migrations
-3. Auth, roles, tenant isolation, guest identity
+1. Detailed backend architecture, written to `docs/ARCHITECTURE.md`, no code (done)
+2. Domain models + migrations (done)
+3. Auth, roles, tenant isolation, guest identity (done)
 4. Catalog (categories, services)
 5. Specialists + reviews — read-only
 6. Availability engine — pure slot computation, read-only, heavily unit-tested

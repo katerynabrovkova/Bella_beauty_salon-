@@ -8,8 +8,8 @@ provider strategy, frontend cadence) were made — this document references thos
 decisions rather than restating them, and goes one level deeper into structure and
 mechanism.
 
-No code, models, or apps exist yet. This document is the plan for Stage 2 onward, and
-is expected to be revised if Stage 2 implementation surfaces a problem with it. The
+Stages 1–3 (domain models, and auth/roles/tenant isolation/guest identity) are done;
+this document is revised as later-stage implementation surfaces problems with it. The
 concrete numbers referenced throughout (deposit percentage, cancellation cutoff,
 booking window limits, payment hold duration) live in `docs/DECISIONS.md` § Business
 rules, not here.
@@ -50,9 +50,13 @@ boundary, not called out as an open question.
 
 Described, not modeled in code:
 
-- **Salon** — tenant root. Everything else scopes to it via a `salon` FK.
+- **Salon** — tenant root. Everything else scopes to it via a `salon` FK. `is_active`
+  (default `True`) gates tenant resolution — an inactive or unknown slug resolves the
+  same way, `404` (§ 3, `docs/DECISIONS.md` § Stage 3 decisions).
 - **User** — Django auth identity, platform-wide (not salon-scoped). Used for both
-  registered customers and salon staff logins.
+  registered customers and salon staff logins. `email_verified_at` (nullable) gates
+  guest→registered `Customer` linking (§ 3) and review eligibility is unaffected by
+  it directly — only the linked `Customer` matters there.
 - **SalonStaff** — join of `User` × `Salon` with a `role`. A back-office login.
 - **Customer** — per-salon identity, nullable `User` FK, per `docs/DECISIONS.md` §
   Identity. All customer-facing domain rows (appointments, reviews) hang off this, not
@@ -62,8 +66,8 @@ Described, not modeled in code:
   blocked on the calendar after the appointment for cleanup/room turnaround, never
   itself offered as a bookable start — see § 6–7; kept per-service, not salon-wide,
   because turnaround differs by service).
-- **Specialist** — salon FK, name, bio, photo. No login in this build (see open
-  questions).
+- **Specialist** — salon FK, name, bio, photo. No login in this build
+  (`docs/DECISIONS.md` § Business rules).
 - **`Service` and `Specialist` rows can never be hard-deleted once an `Appointment`
   references them** — the FK would either cascade-delete real booking history or
   require `SET NULL`/`PROTECT` gymnastics that make "delete" mean something
@@ -89,6 +93,11 @@ Described, not modeled in code:
   creation for `PENDING_PAYMENT` appointments — see § lifecycle), status (see §
   lifecycle), audit fields (`created_at`, `cancelled_at`, `cancelled_by`,
   `cancellation_reason`).
+- **GuestAccessToken** — salon FK, appointment FK, `token_hash` (SHA-256 of the
+  signed token, never the raw value), `expires_at`, `cancelled_via_token_at`
+  (nullable — separate from `expires_at` so cancelling doesn't revoke view access;
+  see § 3). Lives in `booking`, not `accounts` (`docs/DECISIONS.md` § Stage 3
+  sub-step 3 decisions).
 - **Payment** — salon FK, appointment FK (one deposit payment per appointment),
   amount, status (see § lifecycle), provider reference id.
 - **ProcessedWebhookEvent** — provider event id (unique), processed timestamp. Not a
@@ -159,6 +168,8 @@ Permission classes (DRF, added when the API lands):
 
 - `IsSalonStaff(*roles)` — checks a `SalonStaff` row exists for `request.user` and
   the resolved tenant (§ 5), optionally restricted to specific roles.
+- `IsAuthenticatedCustomer` — checks `request.user` is authenticated and has a
+  `Customer` row in the resolved tenant (§ 5).
 - `IsOwnCustomer` — object-level check that the acting `Customer` (from the JWT or
   a validated guest token) matches the object's `customer` FK.
 - `HasValidGuestToken` — validates the signed token from § 3 in `has_permission` (not
@@ -208,11 +219,12 @@ path-prefix resolution):
 - **Cross-tenant FK assignment** (e.g. an `Appointment` pointing at a `Specialist`
   from a different salon than the `Appointment.salon` itself) is the sharpest edge
   case here. Two layers: the service layer validates every FK target's `salon`
-  matches before saving; at the DB level, the recommended pattern (to decide
-  concretely at Stage 2 model design) is a composite unique index `(id, salon)` on
-  parent tables plus a composite FK `(child.parent_id, child.salon) →
-  (parent.id, parent.salon)` on children — this makes cross-tenant linkage a
-  constraint violation, not just an application bug waiting to happen.
+  matches before saving; at the DB level, the implemented pattern is a composite
+  unique index `(id, salon)` on parent tables plus a composite FK `(child.parent_id,
+  child.salon) → (parent.id, parent.salon)` on children (`core/db.py`'s
+  `composite_tenant_fk`, 14 call sites across migrations as of Stage 3) — this makes
+  cross-tenant linkage a constraint violation, not just an application bug waiting to
+  happen.
 
 ## 6. Availability computation
 
