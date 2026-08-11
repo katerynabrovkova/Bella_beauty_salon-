@@ -109,6 +109,20 @@ salons without rework.
   from a URL parameter, which a view could be tricked into using without the
   corresponding object-permission check ever running); `has_object_permission` is only
   a redundant confirmation once the object is fetched.
+- **A DRF `ModelSerializer`'s automatic `UniqueTogetherValidator` (built from
+  `Meta.constraints`, not only the legacy `Meta.unique_together`) silently does
+  nothing for any `(salon, X)` uniqueness constraint** — `salon` is always read-only
+  (it comes from the URL's tenant context, never client input) and carries no
+  Django-level default, and DRF's `get_unique_together_validators()` drops any
+  constraint whose fields aren't all present in the serializer's writable-or-defaulted
+  set, with no error raised. Every `TenantScopedModel` with a `(salon, X)` constraint
+  hits this. Add an explicit `validate_<field>` method that checks the
+  already-tenant-scoped manager instead (see `catalog/serializers.py`) — never rely on
+  the automatic validator for a tenant-scoped uniqueness constraint. That check is
+  check-then-write, not race-proof; the database constraint is the real guarantee, and
+  `core.exceptions.exception_handler` translates a resulting `UniqueViolation` into the
+  same structured 400 as a backstop (see `docs/DECISIONS.md` § Stage 4 decisions for
+  the full account).
 
 ## Coding conventions
 

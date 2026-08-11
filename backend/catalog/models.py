@@ -6,6 +6,7 @@ from core.models import TenantScopedModel, TimeStamped
 class ServiceCategory(TenantScopedModel, TimeStamped):
     name = models.CharField(max_length=255)
     ordering = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
 
     class Meta(TenantScopedModel.Meta):
         abstract = False
@@ -32,6 +33,16 @@ class Service(TenantScopedModel, TimeStamped):
     duration_minutes = models.PositiveIntegerField()
     price = models.DecimalField(max_digits=10, decimal_places=2)
     buffer_minutes = models.PositiveIntegerField(default=0)
+    ordering = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta(TenantScopedModel.Meta):
+        abstract = False
+        constraints = [
+            *TenantScopedModel.Meta.constraints,
+            models.UniqueConstraint(fields=["salon", "name"], name="service_salon_name_uniq"),
+        ]
+        ordering = ["ordering", "name"]
 
     def __str__(self) -> str:
         return self.name

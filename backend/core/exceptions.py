@@ -14,7 +14,9 @@ of exception (DomainError, or DRF's own) into a response.
 
 import logging
 
+import psycopg
 from django.conf import settings
+from django.db import IntegrityError
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import exception_handler as _drf_exception_handler
@@ -47,6 +49,12 @@ class InvalidStateTransitionError(DomainError):
     default_message = "This action isn't valid for the current state."
 
 
+class CategoryHasActiveServicesError(DomainError):
+    code = "category_has_active_services"
+    status_code = status.HTTP_409_CONFLICT
+    default_message = "This category still has active services; deactivate or reassign them first."
+
+
 def _envelope(*, code: str, message: str, details: dict | None = None) -> dict:
     return {"error": {"code": code, "message": message, "details": details or {}}}
 
@@ -56,6 +64,26 @@ def exception_handler(exc: Exception, context: dict) -> Response | None:
         return Response(
             _envelope(code=exc.code, message=exc.message, details=exc.details),
             status=exc.status_code,
+        )
+
+    # A serializer-level uniqueness check (e.g. catalog's validate_name,
+    # docs/DECISIONS.md § Stage 4 decisions) is check-then-write and can't
+    # close a race between two concurrent requests; the database constraint
+    # is the actual guarantee. Narrowed to UniqueViolation specifically (not
+    # bare IntegrityError) so an unrelated integrity bug — a FK mismatch, a
+    # violated CHECK constraint — still surfaces as a loud 500 rather than
+    # being reinterpreted as a client validation error. Deliberately generic
+    # (no per-field detail parsed from the constraint name): core has no
+    # domain meaning of its own, and inspecting catalog-specific constraint
+    # names here would violate that boundary.
+    is_unique_violation = isinstance(exc.__cause__, psycopg.errors.UniqueViolation)
+    if isinstance(exc, IntegrityError) and is_unique_violation:
+        return Response(
+            _envelope(
+                code="unique_violation",
+                message="This would duplicate an existing record.",
+            ),
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     response = _drf_exception_handler(exc, context)

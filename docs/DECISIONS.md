@@ -30,6 +30,11 @@ sync if the order ever changes.
 9. Celery + notifications (email + channel abstraction)
 10. Telegram adapter
 11. Review submission (completed-appointment gating)
+11.5. Content localization — per-salon language settings, translatable content
+    across catalog, salon profile, and notification templates. Numbered 11.5,
+    not renumbered into the sequence, so it doesn't invalidate every existing
+    `Stage N` reference elsewhere in this file, `ARCHITECTURE.md`, and code
+    comments for a placement that doesn't require it.
 12. Frontend skeleton — design system, API client, auth
 13. Frontend catalog / service / specialists / reviews
 14. Frontend booking flow + payment + confirmation
@@ -529,3 +534,131 @@ they are stated once, not duplicated.
   an internal tool, not a correctness gap. Deliberately not adding admin-form
   `clean()`-level cross-validation to turn it into a friendlier message — that's UX
   polish beyond this sub-step, revisit only if a real operator workflow needs it.
+
+## Stage 4 decisions (catalog API)
+
+**Summary.** Stage 4 adds the API layer over the existing (Stage 2) `ServiceCategory`/
+`Service` models — no new domain apps, only `catalog/serializers.py`, `catalog/views.py`,
+`catalog/urls.py`, and the model additions below. It exposes standard CRUD, id-keyed
+(no slugs — see below), under `/api/v1/salons/<slug>/{categories,services}/`, list and
+detail, all paginated (`core.pagination.DefaultPagination`, page size 20 / cap 100).
+
+**Read/write split:** reads (`GET`) are public — `AllowAny`, no authentication — matching
+the product requirement that any visitor can browse a salon's catalog before booking.
+Writes (`POST`/`PUT`/`PATCH`/`DELETE`) require `IsSalonStaff` for the URL's resolved
+tenant, computed once per request via `get_permissions()`, reusing the Stage 3 permission
+class rather than new ad-hoc logic. Deactivated (`is_active=False`) rows are filtered out
+of every read by default; the one privileged exception is `include_inactive=true`, which
+only surfaces them to staff of *that exact* salon (§ "Catalog read semantics" below) —
+and, as of the write-method fix also recorded below, is never required on a write, only
+on reads.
+
+**Soft-delete policy:** `DELETE` never removes a row — `catalog/services.py`'s
+`soft_delete_category`/`soft_delete_service` just flip `is_active` to `False` (204 on
+success). Categories refuse to deactivate while they still have active services
+(`CategoryHasActiveServicesError`, 409) — mirroring the real FK's `on_delete=PROTECT`
+in the soft-delete world, an explicit staff resolution rather than a silent cascade or
+orphan. Deactivating a `Service` with existing appointments is unconditionally allowed:
+`Appointment` already snapshots price/deposit at booking time, so a deactivation can't
+retroactively change what's owed on a booking already made — it only stops *new* ones
+(enforced later, in Stage 7's booking-creation service layer, not here).
+
+**Two-layer uniqueness defence** for each model's `(salon, name)` constraint (added in
+this stage): an explicit `validate_name` on both serializers is the primary, friendly
+check (tenant-scoped manager, no access to `salon` needed, since `salon` is always
+read-only). It's check-then-write, not race-proof, so `core.exceptions.exception_handler`
+backstops it — any `psycopg.errors.UniqueViolation` that reaches the database anyway
+(a genuine concurrent race, or any future model that forgets the serializer-level check)
+is translated into the same structured 400 shape, project-wide, rather than surfacing as
+an uncaught 500. Full mechanism and the DRF gotcha that made the explicit check necessary
+in the first place are detailed below.
+
+- **Catalog `slug` fields are dropped from Stage 4.** Considered and withdrawn: the
+  Stage 4 API addresses `ServiceCategory`/`Service` by numeric `<id>` throughout, so a
+  `slug` field would have no consumer in this stage. It's a future frontend concern
+  only — pretty/SEO per-service URLs — and it isn't yet decided whether the public
+  frontend will even have per-service pages rather than a single `/services` listing.
+  Adding it now would drag in transliteration, a new dependency, empty-result
+  fallbacks, and collision-suffix handling for a field nothing reads. Both tables are
+  empty and will stay empty until real salons exist, so adding it later (when the
+  frontend's URL shape is actually decided) is no more expensive than adding it now.
+  Revisit when the public frontend's routing is designed (the Frontend skeleton
+  stage, § Agreed stage order).
+- **Catalog read semantics: reading is public, with no cross-salon surface.** Any
+  visitor, on any salon's site, sees that salon's active services without
+  authentication. Salons are independent — there is no cross-salon browsing surface,
+  no salon directory, and salon owners have no visibility into each other. The one
+  authenticated read privilege is `include_inactive=true`, which lets a salon's own
+  staff see their deactivated services. This privilege is scoped to the staff member's
+  own salon: applying it against another salon's endpoint returns the ordinary public
+  (active-only) result, silently — not an error, not elevated access. Tested
+  explicitly, because the common failure mode here is a permission check that verifies
+  "is staff" without verifying "is staff of *this* salon."
+- **`include_inactive=true` only gates read visibility (list/retrieve GET); it is not
+  required, and has no effect, on writes.** Found while confirming the
+  deactivate→reactivate round trip: `RetrieveUpdateDestroyAPIView` uses the same
+  `get_queryset()` for every method, so the naive version of the is_active filter
+  also hid a deactivated row from `PATCH`/`DELETE`, making a plain `PATCH
+  /services/<id>/ {"is_active": true}` 404 unless the client *also* passed
+  `?include_inactive=true` — a non-obvious, undiscoverable requirement on a write.
+  Fixed by skipping the visibility filter entirely for non-`SAFE_METHODS`: by the time
+  `get_queryset()` runs for a write, `get_permissions()` has already restricted it to
+  `IsSalonStaff` for this exact salon (DRF checks permissions in `dispatch()`, ahead of
+  any handler method), so there's no protective reason left to also hide a deactivated
+  row from a same-salon staff member editing or reactivating it. Reads are unaffected —
+  a public caller, or staff without the flag, still can't `GET` an inactive row, list or
+  single-object.
+- **DRF 3.18 silently skips a `UniqueTogetherValidator` built from `Meta.constraints`
+  when one of the constrained fields is read-only with no default.** Determined by
+  reading `rest_framework/serializers.py`'s `get_unique_together_validators()`
+  directly and confirming empirically
+  (`ServiceCategorySerializer().get_validators()` returned `[]`): DRF 3.18 *does*
+  build a unique-together validator from a `UniqueConstraint` in `Meta.constraints`
+  (not only the legacy `Meta.unique_together`), but the method only considers fields
+  present in `self._writable_fields`, plus read-only fields carrying a `default`. Every
+  `TenantScopedModel`'s `salon` field is read-only (it comes from the URL's tenant
+  context, never the client) and carries no Django-level default, so its `issuperset`
+  guard silently drops any `(salon, X)` constraint's validator, with no error raised —
+  `Service`/`ServiceCategory`'s `(salon, name)` constraints (sub-step 1) hit this
+  immediately. A POSTed duplicate name passed `is_valid()` cleanly and only failed at
+  `.save()`, as an uncaught `IntegrityError` — a 500, not a 400. Fixed two ways: an
+  explicit `validate_name` on both serializers (checks the already-tenant-scoped
+  manager directly — needs no access to `salon` at all) for the ordinary case; and a
+  `core.exceptions.exception_handler` branch translating any
+  `psycopg.errors.UniqueViolation` into the same structured 400, as a backstop for the
+  concurrent-POST race the serializer check can't close on its own — the database
+  constraint is the actual guarantee, the serializer check is only for a good error
+  message. That handler branch is intentionally generic (no per-field detail parsed
+  from the constraint name) to keep `core` domain-agnostic, and applies project-wide —
+  it can only ever turn an already-broken uncaught-`IntegrityError`-as-500 into a clean
+  400, never change a currently-passing request (verified: the three existing
+  `IntegrityError` tests all assert at the ORM layer directly, never through DRF's
+  request cycle, so none of them exercise this code path). This will recur on every
+  future `TenantScopedModel` with a `(salon, X)` constraint — see `CLAUDE.md`'s
+  Architectural rules for the standing instruction.
+
+## Content localization (deferred to Stage 11.5)
+
+Not part of Stage 4, or any stage before it — recorded now because the scope and
+design principle were settled while doing Stage 4's catalog work, and deferring them
+undocumented would risk the catalog model being bolted onto later instead.
+
+- **Deferred to its own dedicated stage** (Stage 11.5, see § Agreed stage order —
+  placed after the backend model/API stages and before the frontend stages, since the
+  frontend needs the real translatable-content shape to build against, not a
+  catalog-only stopgap. Numbered 11.5 rather than inserted into the main sequence,
+  specifically so it doesn't renumber every stage after it and invalidate existing
+  `Stage N` references elsewhere).
+- **Scope is platform-wide, not catalog-only.** Translated content covers service
+  names/descriptions, category names, salon description, and notification templates.
+  It must be designed as one mechanism across all of those models, not bolted onto
+  `catalog` alone and then reinvented for the others.
+- **Design principle already agreed: languages are a per-salon setting, not a
+  platform constant.** A salon declares which languages it operates in. A
+  single-language salon sees single-value fields and is never forced to invent a
+  translation it doesn't need; a multi-language salon must supply every language it
+  has declared. This removes the need for a fallback rule — there's no "missing
+  translation" state to fall back from, because a declared language is a required
+  field, not an optional extra.
+- **Do not implement any part of this before its own stage (Stage 11.5)** — not the
+  model shape, not a placeholder field, not a migration.

@@ -144,6 +144,9 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ],
+    # Fixed default page size, overridable up to a capped maximum
+    # (docs/ARCHITECTURE.md § 13, core/pagination.py).
+    "DEFAULT_PAGINATION_CLASS": "core.pagination.DefaultPagination",
     "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.ScopedRateThrottle"],
     # Rates and reasoning recorded in docs/DECISIONS.md § Stage 3 decisions.
     # guest_token is predeclared for the Stage 3 sub-step that adds the
