@@ -43,6 +43,19 @@ sync if the order ever changes.
 22. Productionization — Docker, CI/CD, README
 23. Production-readiness audit (fresh session)
 
+## Open questions
+
+Not yet decided — recorded here so they surface before the stages that depend
+on them, rather than being forgotten and improvised in the moment.
+
+- **Business model: one-off site sale vs. recurring SaaS subscription.**
+  Affects the stages covering salon onboarding, plans, and billing. Decision
+  needed before those stages.
+- **Tenant resolution source: URL path prefix only, or also custom domain per
+  salon.** Currently path prefix only (Stage 3 middleware, § Multi-tenancy
+  below). Adding domain-based resolution would be additive to the existing
+  middleware, not a rewrite. Decision needed before the public frontend stage.
+
 ## Overall style
 
 - **Modular monolith**, not microservices. A single Django project with
