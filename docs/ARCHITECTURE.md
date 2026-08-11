@@ -81,8 +81,17 @@ Described, not modeled in code:
   parental leave) is modelled as `TimeOff` rows, never as a status on
   `Specialist`. For these three models, soft deactivation means flipping
   `is_active`, never a `DELETE` of a row an `Appointment` might reference.
-- **Specialist ↔ Service** — many-to-many; not every specialist performs every
-  service.
+  Deactivating a `Specialist` is additionally refused outright (409) while
+  they still have a future non-cancelled `Appointment` — Stage 5 has no
+  payment/notification/conflict-resolution layer yet to honor the standing
+  rule that such a conflict be explicitly resolved, never silently orphaned
+  (`docs/DECISIONS.md` § Business rules, § Stage 5 decisions); revisit at
+  Stage 19.
+- **Specialist ↔ Service** — many-to-many via an explicit `SpecialistService`
+  through model, not a bare `ManyToManyField` (not every specialist performs
+  every service) — the explicit through model is needed so the pairing
+  itself can carry the composite cross-tenant FK protection on both sides
+  (§ 5).
 - **WorkingHours** — specialist FK, day-of-week, start/end time (recurring weekly
   template).
 - **TimeOff** — specialist FK, date range, reason (exception to `WorkingHours`).

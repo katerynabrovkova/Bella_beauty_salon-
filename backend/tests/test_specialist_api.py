@@ -1,5 +1,5 @@
 """
-Specialist API tests (docs/ARCHITECTURE.md § 5, § 13; Stage 5 sub-step 5).
+Specialist API tests (docs/ARCHITECTURE.md § 4, § 13; Stage 5 sub-step 5).
 """
 
 import datetime as dt

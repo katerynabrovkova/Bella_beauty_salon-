@@ -1,5 +1,5 @@
 """
-Specialist API views (docs/ARCHITECTURE.md § 5, § 13; Stage 5 sub-step 5).
+Specialist API views (docs/ARCHITECTURE.md § 4, § 13; Stage 5 sub-step 5).
 
 Reads are public (AllowAny); writes require IsSalonStaff for the resolved
 tenant, same read/write split as catalog (docs/DECISIONS.md § Stage 4

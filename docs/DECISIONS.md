@@ -786,3 +786,19 @@ decisions, not as notes written after the fact.
   they're keys the caller already has a way to resolve, cost nothing extra
   (the same query that produces the count produces them), and carry no
   customer-facing information.
+- **`core/exceptions.py`'s handler is deliberately narrowed to `UniqueViolation`,
+  so a `ForeignKeyViolation` from a composite tenant FK surfaces as a 500, not a
+  400 — established empirically, not assumed, by Stage 5 sub-step 4's
+  deliberate-break exercise.** Swapping `SpecialistSerializer`'s tenant-scoped
+  queryset for `unscoped_objects` let a cross-salon service id pass validation;
+  the resulting `.save()` raised a raw `psycopg.errors.ForeignKeyViolation` from
+  `SpecialistService`'s composite tenant FK, and the handler's
+  `UniqueViolation`-only rescue (by design — an unrelated integrity bug should
+  surface loudly, not be reinterpreted as client error) does not catch it.
+  Consequence, generalized beyond this one field: the composite tenant FK
+  guarantees a cross-tenant row can never be written, full stop — but it is a
+  last resort that fails loudly (500), never gracefully (400). The clean,
+  field-specific 400 always comes entirely from the serializer-level
+  tenant-scoped queryset check, never from the database constraint underneath
+  it. This applies to every future `many=True` tenant-scoped relation, not only
+  `services`.

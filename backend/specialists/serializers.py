@@ -1,5 +1,5 @@
 """
-Specialist serializer (docs/ARCHITECTURE.md § 5; Stage 5 sub-step 4).
+Specialist serializer (docs/ARCHITECTURE.md § 2, § 4; Stage 5 sub-step 4).
 `salon` is always read-only — it comes from the URL's tenant context
 (tenants.middleware.TenantResolutionMiddleware), never from client input, same
 convention as catalog/serializers.py.

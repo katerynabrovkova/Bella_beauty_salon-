@@ -1,8 +1,8 @@
 """
-Specialist service layer (docs/ARCHITECTURE.md § 5; Stage 5 sub-step 5).
+Specialist service layer (docs/ARCHITECTURE.md § 2; Stage 5 sub-step 5).
 
 Soft delete only — Specialist rows are never hard-deleted once they could be
-referenced by an Appointment (docs/ARCHITECTURE.md § 5), same as catalog's
+referenced by an Appointment (docs/ARCHITECTURE.md § 2), same as catalog's
 Service/ServiceCategory (catalog/services.py). Deactivation is additionally
 refused outright (409) if the specialist still has a future non-cancelled
 appointment — docs/DECISIONS.md § Stage 5 decisions records why: this stage
