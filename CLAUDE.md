@@ -42,6 +42,21 @@ When implementing:
 - Don't silently change architecture — if something in `docs/DECISIONS.md`
   needs to change, say so and update it in the same change.
 - Run the relevant tests/checks after implementing and report the results.
+- **An empty `git diff` proves nothing for a file `git status` reports as
+  `??` (untracked).** Git has no tracked baseline to compare against, so the
+  diff comes back empty regardless of the file's actual content — whether or
+  not a revert really happened. This comes up constantly mid-stage, since a
+  substep's new files are usually still untracked when you need to verify an
+  experiment (e.g. a deliberate break-it-to-prove-the-test-works exercise)
+  was fully undone. Verify a revert on an untracked file by reading it
+  directly and/or re-running the tests it affects, or commit (or `git add`)
+  before experimenting so a real baseline exists to diff against. The same
+  caution applies to proving a test goes red: a green (or red) run under
+  `-k`, `-x`, `-m`, or `--lf` only means "for whatever subset got selected,"
+  never the full claim — always confirm the specific test you were asked
+  about was actually collected and executed, by running it unfiltered or by
+  quoting its own verbatim pytest result line, not a summary of a
+  differently-scoped run.
 
 ## Project purpose
 
@@ -123,6 +138,20 @@ salons without rework.
   `core.exceptions.exception_handler` translates a resulting `UniqueViolation` into the
   same structured 400 as a backstop (see `docs/DECISIONS.md` § Stage 4 decisions for
   the full account).
+- **A relational serializer field declared with `many=True` is not what ends up in
+  `self.fields`.** DRF's `many_init()` wraps the declared field (e.g.
+  `PrimaryKeyRelatedField(many=True, ...)`) in a `ManyRelatedField`, which has no
+  `queryset` attribute of its own — the actual field instance holding the real
+  `queryset`, the one `to_internal_value()` runs against per item, lives on
+  `.child_relation`. A serializer that rebinds a tenant-scoped queryset in
+  `__init__` for a `many=True` field (the same pattern as `category_id` above, but
+  for a to-many relation) must target `self.fields["<name>"].child_relation.queryset`,
+  never `self.fields["<name>"].queryset` directly — the latter silently sets an
+  unused attribute on the wrapper and leaves validation running against the empty
+  class-body placeholder forever, rejecting every id from every tenant, including
+  the current one. Found via `specialists/serializers.py`'s `services` field (Stage 5
+  sub-step 4) failing its own same-salon test until this was corrected. This will
+  recur on every future `many=True` tenant-scoped relation.
 
 ## Coding conventions
 
