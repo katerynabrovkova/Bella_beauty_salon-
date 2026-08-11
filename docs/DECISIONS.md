@@ -23,13 +23,13 @@ sync if the order ever changes.
 2. Domain models + migrations (done)
 3. Auth, roles, tenant isolation, guest identity (done)
 4. Catalog (categories, services)
-5. Specialists + reviews — read-only
+5. Specialists — full CRUD (read public, writes gated by IsSalonStaff — same split as Stage 4 catalog)
 6. Availability engine — pure slot computation, read-only, heavily unit-tested
 7. Booking core — creation, statuses, cancellation, concurrency
 8. Payments — provider abstraction, deposit, webhooks, refunds
 9. Celery + notifications (email + channel abstraction)
 10. Telegram adapter
-11. Review submission (completed-appointment gating)
+11. Reviews — read endpoints and submission (completed-appointment gating)
 11.5. Content localization — per-salon language settings, translatable content
     across catalog, salon profile, and notification templates. Numbered 11.5,
     not renumbered into the sequence, so it doesn't invalidate every existing
@@ -60,6 +60,13 @@ on them, rather than being forgotten and improvised in the moment.
   salon.** Currently path prefix only (Stage 3 middleware, § Multi-tenancy
   below). Adding domain-based resolution would be additive to the existing
   middleware, not a rewrite. Decision needed before the public frontend stage.
+- **Specialist photos: storage, upload flow, and whether the public frontend
+  needs them at all.** `docs/ARCHITECTURE.md` listed a `photo` field on
+  `Specialist` from the original Stage 1 design pass, but it was never
+  implemented in any migration (confirmed against the Stage 2 domain-model
+  commits) and Stage 5 explicitly leaves it out. Needs a decision — image
+  storage/CDN choice, who is allowed to upload, whether it's required or
+  optional per specialist — before the frontend specialist pages (Stage 13).
 
 ## Overall style
 
@@ -662,3 +669,76 @@ undocumented would risk the catalog model being bolted onto later instead.
   field, not an optional extra.
 - **Do not implement any part of this before its own stage (Stage 11.5)** — not the
   model shape, not a placeholder field, not a migration.
+
+## Stage 5 decisions (specialists API)
+
+Decided 2026-08-11, before implementation — recorded here as agreed-in-advance
+decisions, not as notes written after the fact.
+
+- **Reviews removed from Stage 5; read endpoints move to Stage 11, alongside
+  submission.** The stage order originally bundled "Specialists + reviews —
+  read-only" into one stage. Split apart because a read-only review endpoint
+  built now would return an empty list — no completed appointment can exist
+  yet, since booking (Stage 7) hasn't landed — and would prove nothing in a
+  test. Stage 11 (review submission, completed-appointment gated) would need
+  to touch the same serializer anyway once real data exists, so building it
+  twice (once now, against no data, and again in Stage 11) is pure rework.
+  `docs/ARCHITECTURE.md`'s app table already places `Review` in its own
+  `reviews` app, unaffected by this — only the *stage* that ships its read API
+  moved, not its ownership.
+- **Stage 5 is full CRUD, not read-only.** The original stage-order line said
+  "read-only." Changed because Stages 18–21 are frontend admin layers
+  (services/specialists/working-hours management, per § Agreed stage order)
+  and need a write API to already exist by the time they're built — exactly
+  the same reasoning Stage 4 used to justify catalog CRUD rather than a
+  read-only catalog API. Reads stay public (`AllowAny`) and writes gated by
+  `IsSalonStaff`, the same split as catalog.
+- **`Specialist.is_active` moves from Stage 20 to Stage 5.** `docs/ARCHITECTURE.md`
+  § 5 previously assigned this field to Stage 20 ("admin services, specialists,
+  working hours, days off"), reasoning that Stage 2 had no admin UI to set it.
+  That reasoning no longer holds once Stage 5 ships a write API of its own — a
+  specialist CRUD API with no way to deactivate a former employee without a
+  hard delete would immediately violate the "never hard-delete a row an
+  `Appointment` might reference" rule (`docs/ARCHITECTURE.md` § 5). Moved
+  earlier so the CRUD API is complete on arrival rather than shipping a
+  known-incomplete delete story now and patching it in fifteen stages. Its
+  meaning is employment status only: `True` = currently employed, `False` =
+  no longer employed. It is explicitly **not** a general availability or
+  visibility flag — it says nothing about whether a specialist is bookable on
+  a given day.
+- **Temporary absence (vacation, sick leave, parental leave) is not modelled
+  as a status on `Specialist` — it is `TimeOff` rows, which already exist.**
+  Considered and rejected: adding an absence-related status field would
+  duplicate what `TimeOff` already represents and raise a question `TimeOff`
+  doesn't have to answer — how long an absence must be before it flips a
+  status, and what happens automatically when it's over. No duration
+  threshold is needed anywhere in code for this: the booking/availability
+  window is capped at 60 days out (`docs/DECISIONS.md` § Business rules), so a
+  specialist absent longer than that simply has no bookable slots inside the
+  window the client can ever see — the absence is invisible on its own,
+  without any code needing to know how long it is or classify it as "long"
+  vs. "short."
+- **No `UniqueConstraint(salon, name)` on `Specialist`, and consequently no
+  `validate_name`.** The catalog pattern (`(salon, name)` uniqueness on
+  `ServiceCategory`/`Service`, with the DRF 3.18 unique-together trap worked
+  around via an explicit `validate_name`, `docs/DECISIONS.md` § Stage 4
+  decisions) does not transfer here. Catalog uniqueness models a real business
+  rule — a salon shouldn't offer two identically-named services. Two
+  specialists sharing a name is not an error; salons legitimately employ two
+  people with the same first name. Since there's no uniqueness constraint on
+  `Specialist`, the DRF gotcha that motivated `validate_name` on the catalog
+  serializers doesn't arise here — there is nothing for the automatic
+  validator to silently skip, because there is no constraint for it to be
+  built from.
+- **Stage 6 (availability engine) must exclude `is_active=False` specialists
+  from slot computation, and this does not follow automatically from
+  `TimeOff`.** A terminated employee has no `TimeOff` rows — nothing marks
+  their calendar as unavailable — so an engine that only subtracts
+  `WorkingHours` minus `TimeOff` minus existing appointments would happily
+  keep offering slots for someone who no longer works at the salon. Recorded
+  here, against Stage 5, rather than left for Stage 6 to discover, because
+  `is_active` is deliberately *not* an availability flag (the point directly
+  above) — that framing makes it easy for a later reader to conclude the
+  availability engine has no business consulting it at all, when in fact it
+  must, just as a hard exclusion rather than as part of the open-windows
+  computation.

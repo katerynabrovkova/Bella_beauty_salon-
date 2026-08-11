@@ -66,16 +66,21 @@ Described, not modeled in code:
   blocked on the calendar after the appointment for cleanup/room turnaround, never
   itself offered as a bookable start — see § 6–7; kept per-service, not salon-wide,
   because turnaround differs by service).
-- **Specialist** — salon FK, name, bio, photo. No login in this build
+- **Specialist** — salon FK, name, bio, is_active (Stage 5). No login in this build
   (`docs/DECISIONS.md` § Business rules).
 - **`Service` and `Specialist` rows can never be hard-deleted once an `Appointment`
   references them** — the FK would either cascade-delete real booking history or
   require `SET NULL`/`PROTECT` gymnastics that make "delete" mean something
-  different depending on whether the row has ever been booked. No
-  `is_active`/soft-deactivation field is added yet (Stage 2 has no admin UI that
-  would set it), but this is a known, recorded gap: admin "remove this service/
-  specialist" (Stage 20) must be a soft deactivation, not a `DELETE`, and the
-  field lands with that stage, not before.
+  different depending on whether the row has ever been booked. `Service` and
+  `ServiceCategory` got an `is_active` soft-deactivation field in Stage 4;
+  `Specialist` gets its own `is_active` in Stage 5, not at Stage 20 as
+  originally planned here (see `docs/DECISIONS.md` § Stage 5 decisions for why
+  that moved earlier). Its meaning on `Specialist` is employment status only —
+  True currently employed, False no longer employed — not a general
+  availability/visibility flag: temporary absence (vacation, sick leave,
+  parental leave) is modelled as `TimeOff` rows, never as a status on
+  `Specialist`. For these three models, soft deactivation means flipping
+  `is_active`, never a `DELETE` of a row an `Appointment` might reference.
 - **Specialist ↔ Service** — many-to-many; not every specialist performs every
   service.
 - **WorkingHours** — specialist FK, day-of-week, start/end time (recurring weekly
