@@ -55,6 +55,14 @@ class CategoryHasActiveServicesError(DomainError):
     default_message = "This category still has active services; deactivate or reassign them first."
 
 
+class SpecialistHasFutureAppointmentsError(DomainError):
+    code = "specialist_has_future_appointments"
+    status_code = status.HTTP_409_CONFLICT
+    default_message = (
+        "This specialist has future appointments; they must be resolved before deactivating."
+    )
+
+
 def _envelope(*, code: str, message: str, details: dict | None = None) -> dict:
     return {"error": {"code": code, "message": message, "details": details or {}}}
 

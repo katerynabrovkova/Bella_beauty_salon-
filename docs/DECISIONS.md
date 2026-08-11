@@ -742,3 +742,47 @@ decisions, not as notes written after the fact.
   availability engine has no business consulting it at all, when in fact it
   must, just as a hard exclusion rather than as part of the open-windows
   computation.
+- **Deactivating a specialist with future non-cancelled appointments is refused
+  (409), not allowed-and-cleaned-up.** `docs/DECISIONS.md` § Business rules
+  already requires that a staff-side change conflicting with an existing
+  appointment be detected and explicitly resolved — never silently orphaned —
+  offering the customer a rebooking with another specialist, a rebooking with
+  the same specialist later, or a fully refunded cancellation. Stage 5 has no
+  payment layer (Stage 8), no notifications (Stage 10), and no
+  conflict-resolution flow (Stage 19); it can detect the conflict but cannot
+  honor any of those three resolutions. Refusing outright is the only behavior
+  consistent with the existing rule until those stages exist. Revisit at Stage
+  19, when the real resolution flow can replace this refusal.
+- **"Still expected," for that refusal, reuses `booking`'s own
+  `ACTIVE_APPOINTMENT_STATUSES` (`PENDING_PAYMENT`, `CONFIRMED`) directly,
+  imported from `booking.models` — not a second, hand-written list.** The
+  double-booking exclusion constraint (`booking/models.py`,
+  `appointment_no_overlapping_active_bookings`) already treats exactly this
+  status set as "this appointment holds a slot," and it's already reused once
+  across an app boundary this way (`booking/views.py`'s guest-cancellation
+  eligibility check). "Does this appointment hold a slot" and "does this
+  appointment block specialist termination" are the same underlying question;
+  importing the same constant, rather than writing a second one, is what keeps
+  them from silently drifting apart the day a status is added or renamed.
+- **"Future," for that refusal, means `end_datetime > now()` — `blocked_until`
+  was considered and rejected.** `blocked_until` (`end_datetime` plus the
+  service's buffer minutes) is the more conservative-looking option, but the
+  buffer exists to block the calendar for room/equipment turnaround — it is
+  not the specialist's obligation to a customer. The refusal exists because a
+  customer is still expected; once the visit itself ends, nobody is waiting on
+  the specialist anymore, even if the room is nominally still occupied for
+  cleanup. Using `end_datetime` also means an appointment already in progress
+  (started, not yet ended) counts as blocking — the specialist has a live
+  commitment right up until the visit ends. `now()` is
+  `django.utils.timezone.now()`, compared directly against the UTC-stored
+  `end_datetime` with no conversion (`docs/DECISIONS.md` § Timezone).
+- **The 409 response includes both a count and the conflicting appointment
+  ids:** `details={"future_appointment_count": N, "future_appointment_ids":
+  [...]}`. A bare count (the original proposal) was rejected as leaving staff
+  with a known blocker and no way to act on it without a manual hunt. Full
+  appointment detail (customer name, time, service) was also rejected: that
+  would mean designing a response shape for Stage 19's not-yet-built
+  conflict-resolution UI before its actual needs are known. Ids are neither —
+  they're keys the caller already has a way to resolve, cost nothing extra
+  (the same query that produces the count produces them), and carry no
+  customer-facing information.
