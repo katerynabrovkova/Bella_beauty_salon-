@@ -1,6 +1,7 @@
 """
-Stage 6.C — open-window computation (docs/ARCHITECTURE.md § 6 step 1;
-docs/DECISIONS.md § Stage 6 decisions and § Stage 6.C decisions).
+Stage 6.C/6.D — open-window computation (docs/ARCHITECTURE.md § 6 step 1;
+docs/DECISIONS.md § Stage 6 decisions, § Stage 6.C decisions, § Stage 6.D
+decisions).
 
 Written against the agreed design before any implementation exists — this
 file is expected to fail on collection (ModuleNotFoundError) until
@@ -15,10 +16,13 @@ scheduling/services.py is written. Two layers, matching the functional-core
   (docs/ARCHITECTURE.md § 6), not a convention break — same precedent as
   specialists/services.py's _future_appointments.
 - The compute_open_windows tests exercise the orchestrator end-to-end
-  against real WorkingHours/TimeOff rows, via make_working_hours/
-  make_time_off (tests/conftest.py), the same pattern as make_appointment.
-  Two of these exist specifically to prove the pure functions above are
-  actually wired into the orchestrator, not just correct in isolation.
+  against real WorkingHours/TimeOff/Appointment rows, via
+  make_working_hours/make_time_off/make_appointment (tests/conftest.py).
+  Several of these exist specifically to prove the pure functions above are
+  actually wired into the orchestrator, not just correct in isolation — 6.D
+  extends this same section (compute_open_windows's signature is unchanged;
+  only its body gained a second blocking source, docs/DECISIONS.md § Stage
+  6.D decisions), rather than adding a new file or a new entry point.
 """
 
 import datetime as dt
@@ -26,6 +30,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from accounts.models import Customer
+from booking.models import ACTIVE_APPOINTMENT_STATUSES, AppointmentStatus
+from catalog.models import Service, ServiceCategory
 from core.exceptions import InvalidDateRangeError
 from core.tenancy import tenant_context
 from scheduling.services import (
@@ -35,7 +42,8 @@ from scheduling.services import (
     _subtract_intervals,
     compute_open_windows,
 )
-from tests.conftest import make_time_off, make_working_hours
+from specialists.models import Specialist
+from tests.conftest import make_appointment, make_time_off, make_working_hours
 
 UTC = dt.UTC
 DAY = dt.date(2026, 8, 17)
@@ -557,3 +565,594 @@ def test_compute_open_windows_spring_forward_and_fall_back(salon, specialist):
 
     fall_starts = sorted(w.start for w in fall)
     assert fall_starts[1] - fall_starts[0] == dt.timedelta(hours=25)
+
+
+# --- compute_open_windows + Appointments (6.D) ------------------------
+
+
+def test_compute_open_windows_no_appointments_matches_pre_appointment_behavior(salon, specialist):
+    """Case 1 — appointments integrated, but zero exist; result is identical
+    to 6.C's own single-shift behavior."""
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 15, 0, tzinfo=UTC)
+        )
+    ]
+
+
+def test_compute_open_windows_appointment_splits_window(salon, customer, specialist, service):
+    """Case 2."""
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),  # local 12:00
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        ),
+        Window(
+            dt.datetime(2026, 8, 17, 10, 15, tzinfo=UTC),
+            dt.datetime(2026, 8, 17, 15, 0, tzinfo=UTC),
+        ),
+    ]
+
+
+def test_compute_open_windows_appointment_blocked_until_extends_past_window_end(
+    salon, customer, specialist, service
+):
+    """Case 3."""
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 14, 30, tzinfo=UTC),  # local 17:30; blocked_until 15:45 UTC
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 14, 30, tzinfo=UTC)
+        )
+    ]
+
+
+def test_compute_open_windows_back_to_back_appointments_merge_into_one_gap(
+    salon, customer, specialist, service
+):
+    """Case 4."""
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    first = make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=first.blocked_until,
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        ),
+        Window(
+            dt.datetime(2026, 8, 17, 11, 30, tzinfo=UTC),
+            dt.datetime(2026, 8, 17, 15, 0, tzinfo=UTC),
+        ),
+    ]
+
+
+def test_compute_open_windows_window_after_appointment_starts_exactly_at_blocked_until(
+    salon, customer, specialist, service
+):
+    """Case 5 — half-open boundary convention, through a real
+    appointment-derived blocker rather than hand-built Window literals."""
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    appointment = make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result[1].start == appointment.blocked_until
+
+
+@pytest.mark.parametrize("status", ACTIVE_APPOINTMENT_STATUSES)
+def test_compute_open_windows_active_status_appointment_blocks(
+    salon, customer, specialist, service, status
+):
+    """
+    Mirror image of the terminal-status test below: an implementation using
+    status=AppointmentStatus.CONFIRMED instead of
+    status__in=ACTIVE_APPOINTMENT_STATUSES would pass every other test in
+    this file, since make_appointment's own default is CONFIRMED —
+    PENDING_PAYMENT would never be exercised as a blocking status otherwise.
+    """
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        status=status,
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        ),
+        Window(
+            dt.datetime(2026, 8, 17, 10, 15, tzinfo=UTC),
+            dt.datetime(2026, 8, 17, 15, 0, tzinfo=UTC),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        AppointmentStatus.CANCELLED,
+        AppointmentStatus.EXPIRED,
+        AppointmentStatus.COMPLETED,
+        AppointmentStatus.NO_SHOW,
+    ],
+)
+def test_compute_open_windows_terminal_status_appointment_does_not_block(
+    salon, customer, specialist, service, status
+):
+    """Case 6."""
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        status=status,
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 15, 0, tzinfo=UTC)
+        )
+    ]
+
+
+def test_compute_open_windows_appointment_on_a_different_day_does_not_affect_other_days(
+    salon, customer, specialist, service
+):
+    """Case 7."""
+    monday = dt.date(2026, 8, 17)
+    tuesday = monday + dt.timedelta(days=1)
+    for day in (monday, tuesday):
+        make_working_hours(
+            salon=salon,
+            specialist=specialist,
+            day_of_week=day.weekday(),
+            start_time=dt.time(9, 0),
+            end_time=dt.time(18, 0),
+        )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),  # Monday only
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=tuesday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        ),
+        Window(
+            dt.datetime(2026, 8, 17, 10, 15, tzinfo=UTC),
+            dt.datetime(2026, 8, 17, 15, 0, tzinfo=UTC),
+        ),
+        Window(
+            dt.datetime(2026, 8, 18, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 18, 15, 0, tzinfo=UTC)
+        ),
+    ]
+
+
+def test_compute_open_windows_appointment_for_a_different_specialist_does_not_block(
+    salon, customer, specialist, service
+):
+    """Case 8."""
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    with tenant_context(salon.id):
+        other_specialist = Specialist.objects.create(salon=salon, name="Other Specialist")
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=other_specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 15, 0, tzinfo=UTC)
+        )
+    ]
+
+
+def test_compute_open_windows_appointment_starting_before_range_still_clips(
+    salon, customer, specialist, service
+):
+    """
+    Case 9. An early-morning shift (00:00-03:00 local) puts the range
+    boundary (local midnight) inside the window, so an appointment that
+    started the salon-local day before but extends into the shift must
+    still be fetched and still clip. A start_datetime__gte=range_start_utc
+    filter, instead of the correct overlap condition, would exclude it and
+    this test would see the whole window unclipped.
+    """
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(0, 0),
+        end_time=dt.time(3, 0),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 16, 20, 30, tzinfo=UTC),  # local Aug 16 23:30
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 16, 21, 45, tzinfo=UTC), dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+        )
+    ]
+
+
+def test_compute_open_windows_appointment_ending_after_range_still_clips(
+    salon, customer, specialist, service
+):
+    """
+    Case 10. A late-night shift (22:00-23:30 local) so an appointment whose
+    blocked_until extends past the range's own end still clips. The correct
+    query has no upper bound on blocked_until at all — a version that added
+    one (e.g. blocked_until__lte=range_end_utc) would incorrectly exclude
+    this appointment.
+    """
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(22, 0),
+        end_time=dt.time(23, 30),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 20, 0, tzinfo=UTC),  # local 23:00
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 19, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 20, 0, tzinfo=UTC)
+        )
+    ]
+
+
+def test_compute_open_windows_time_off_and_appointment_overlapping_each_other_compose(
+    salon, customer, specialist, service
+):
+    """Case 11 — a TimeOff and an Appointment overlapping EACH OTHER (not
+    just the window), proving the two adapters' output is concatenated and
+    merged as one list before subtraction, not applied as two independent
+    passes."""
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    make_time_off(
+        salon=salon,
+        specialist=specialist,
+        start_datetime=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        end_datetime=dt.datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 9, 45, tzinfo=UTC),
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        ),
+        Window(
+            dt.datetime(2026, 8, 17, 11, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 15, 0, tzinfo=UTC)
+        ),
+    ]
+
+
+def test_compute_open_windows_appointment_exactly_matching_window_returns_no_windows(
+    salon, customer, specialist, service
+):
+    """Case 12. WorkingHours sized to exactly match the service's own
+    duration+buffer block (75 minutes)."""
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(12, 0),
+        end_time=dt.time(13, 15),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),  # local 12:00
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == []
+
+
+def test_compute_open_windows_ignores_appointment_from_a_different_salon(
+    salon, other_salon, specialist
+):
+    """
+    Case 13. A cross-salon appointment does not leak into this salon's
+    computed windows.
+
+    This does NOT isolate tenant scoping specifically: _fetch_appointments
+    filters by a specific specialist OBJECT, and Specialist uses one global
+    auto-incrementing id across every salon, so no two Specialist rows
+    anywhere can ever share a pk — `specialist=specialist` alone already
+    makes cross-salon leakage structurally impossible here, regardless of
+    Appointment.objects vs Appointment.unscoped_objects. The composite
+    tenant FK on Appointment (core/db.py's composite_tenant_fk) additionally
+    guarantees Appointment.salon_id always equals
+    Appointment.specialist.salon_id, so the two managers can never disagree
+    on a query already filtered to one specialist. other_salon's specialist
+    is still named "Jane" — same as this file's own specialist fixture — so
+    a reader can see no accidental name coincidence is doing any work
+    either. This is a regression/documentation safety net for the
+    guarantee, not a test that would fail under a manager swap.
+    """
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    with tenant_context(other_salon.id):
+        other_category = ServiceCategory.objects.create(salon=other_salon, name="Nails")
+        other_service = Service.objects.create(
+            salon=other_salon,
+            category=other_category,
+            name="Manicure",
+            duration_minutes=60,
+            price="500.00",
+            buffer_minutes=15,
+        )
+        other_specialist = Specialist.objects.create(salon=other_salon, name="Jane")
+        other_customer = Customer.objects.create(
+            salon=other_salon, name="Bob", email="bob@example.com", phone="+10000000001"
+        )
+    make_appointment(
+        salon=other_salon,
+        customer=other_customer,
+        specialist=other_specialist,
+        service=other_service,
+        start=dt.datetime(2026, 8, 17, 12, 0, tzinfo=UTC),
+    )
+    with tenant_context(salon.id):
+        result = compute_open_windows(
+            specialist=specialist,
+            date_from=monday,
+            date_to=monday,
+            salon_timezone=salon.timezone,
+        )
+    assert result == [
+        Window(
+            dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC), dt.datetime(2026, 8, 17, 15, 0, tzinfo=UTC)
+        )
+    ]
+
+
+def test_compute_open_windows_issues_exactly_three_queries(
+    django_assert_num_queries, salon, customer, specialist, service
+):
+    """Case 14. docs/DECISIONS.md § Stage 6.D decisions: pinned because this
+    project has already lost query efficiency to an unpinned regression once
+    (a missing select_related in Stage 4)."""
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    make_time_off(
+        salon=salon,
+        specialist=specialist,
+        start_datetime=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        end_datetime=dt.datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 11, 0, tzinfo=UTC),
+    )
+    with tenant_context(salon.id):
+        with django_assert_num_queries(3):
+            compute_open_windows(
+                specialist=specialist,
+                date_from=monday,
+                date_to=monday,
+                salon_timezone=salon.timezone,
+            )

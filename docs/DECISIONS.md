@@ -86,6 +86,14 @@ on them, rather than being forgotten and improvised in the moment.
   closing time," so a specialist who finishes before the salon closes
   doesn't lose a slot needlessly. Revisit alongside the closure model
   decision.
+- **Blocker provenance through the availability engine.**
+  `compute_open_windows` (§ Stage 6.D decisions) flattens every blocking
+  source — `TimeOff`, `Appointment`, and any future closure source — into
+  indistinguishable `Window`s before subtraction. If a future consumer
+  (e.g. Stage 19's admin calendar, or the AI assistant) needs to explain
+  *why* a specific slot is unavailable, this loses that information by
+  design. Not solved now: the one imagined use case can read the
+  underlying rows directly instead.
 - **`Salon.timezone` write-time validation.** Nothing currently validates
   that `Salon.timezone` is a real IANA zone name at write time (model,
   serializer, or admin form) — a malformed value would only surface as an
@@ -1040,3 +1048,60 @@ by the 6.C design proposal.
   new `DomainError` subclass.** Its HTTP-status/error-envelope mapping is
   not decided now — that lands with the `GET`-endpoint substage, alongside
   `docs/ARCHITECTURE.md` § 14's `EXCEPTION_HANDLER`.
+
+### Stage 6.D decisions (busy-interval subtraction from Appointments)
+
+Decided 2026-08-13, before implementation, resolving the open questions
+raised by the 6.D design proposal.
+
+- **6.D extends `compute_open_windows` directly — no new orchestrator
+  function, no second `_subtract_intervals` call.** Two new functions only:
+  `_fetch_appointments` (mirrors `_fetch_time_off`, with the added
+  `status__in=ACTIVE_APPOINTMENT_STATUSES` filter `TimeOff` has no
+  equivalent of) and `_appointments_to_blocking_intervals` (mirrors
+  `_time_off_to_blocking_intervals`). Their output is concatenated into the
+  same blocking-interval list already built for `TimeOff`, before the
+  single existing `_subtract_intervals` call. Reasoning: `_subtract_intervals`
+  was built in § Stage 6.C decisions specifically to not know a blocker's
+  source; a second real source is that generalisation being used for the
+  second time it was built for, not a new step. `compute_open_windows`'s
+  signature and return type are unchanged.
+- **The interval subtracted is `(start_datetime, blocked_until)`, never
+  `(start_datetime, end_datetime)`.** This is the same buffered interval
+  the `Appointment` exclusion constraint itself protects
+  (`docs/ARCHITECTURE.md` § 2, § 7; `booking/models.py`'s
+  `appointment_no_overlapping_active_bookings`). Subtracting the bare
+  service interval instead would let this engine offer a start time the
+  database is guaranteed to reject — not as a race-condition "you lost the
+  race" case, but deterministically, every time.
+- **Blocking statuses are `booking.ACTIVE_APPOINTMENT_STATUSES`, imported
+  directly, not a second hand-written list.** Same reuse principle already
+  applied in § Stage 5 decisions for `specialists/services.py`'s own
+  future-appointment check — `CANCELLED`, `EXPIRED`, `COMPLETED`, and
+  `NO_SHOW` appointments never block.
+- **`hold_expires_at` is not read by this substage.** A `PENDING_PAYMENT`
+  appointment whose hold has already passed, but whose status the
+  not-yet-built expiry sweep hasn't flipped to `EXPIRED` yet, still counts
+  as blocking. This is the correct failure mode for a read path: it can
+  only ever under-offer availability, never over-offer it — the
+  double-booking guarantee comes from the database exclusion constraint,
+  which doesn't consult `hold_expires_at` either. The sweep itself is Stage
+  7's, not this substage's.
+- **`django_assert_num_queries(3)` is a required test, not an optional
+  nice-to-have.** `compute_open_windows` issues exactly three queries after
+  this change (`WorkingHours`, `TimeOff`, `Appointment`) — pinned because
+  this project has already lost query efficiency to an unpinned regression
+  once (a missing `select_related` in Stage 4, caught only because a
+  query-count assertion existed elsewhere). The risk here is identical: a
+  future change silently turning one fetch into an N+1, with nothing else
+  in the suite positioned to notice.
+- **Blocker provenance (which source — `TimeOff` vs. `Appointment` —
+  produced a given blocked span) is not carried through
+  `_subtract_intervals`'s output.** Recorded as an open question (§ Open
+  questions, below), not solved here: carrying it through would change
+  `_subtract_intervals`'s return type and break the "knows nothing about
+  its sources" contract that is the entire point of the § Stage 6.C
+  decisions generalisation. The one concrete use case for it (Stage 19's
+  admin calendar explaining *why* a slot is unavailable) can read
+  `Appointment`/`TimeOff` rows directly rather than reconstructing them
+  from derived slots, so the need is speculative, not demonstrated.

@@ -1,17 +1,19 @@
 """
-Stage 6.C — open-window computation (docs/ARCHITECTURE.md § 6 step 1;
-docs/DECISIONS.md § Stage 6 decisions and § Stage 6.C decisions).
+Stage 6.C/6.D — open-window computation (docs/ARCHITECTURE.md § 6 step 1;
+docs/DECISIONS.md § Stage 6 decisions, § Stage 6.C decisions, § Stage 6.D
+decisions).
 
-Functional-core / imperative-shell split: _fetch_working_hours and
-_fetch_time_off are the only two functions that touch the tenant-scoped
-ORM (and so are the only two that require tenant context to already be
-bound, via core.tenancy.tenant_context — they don't bind it themselves,
-same convention as every other service-layer function in this project,
-e.g. specialists/services.py's _future_appointments). Everything else here
-is a pure function over plain values, in particular _subtract_intervals,
-which knows nothing about TimeOff/WorkingHours/Appointment at all — the
-generalised blocking-interval list a future closure source would plug into
-without this function changing.
+Functional-core / imperative-shell split: _fetch_working_hours,
+_fetch_time_off, and _fetch_appointments are the only three functions that
+touch the tenant-scoped ORM (and so are the only three that require tenant
+context to already be bound, via core.tenancy.tenant_context — they don't
+bind it themselves, same convention as every other service-layer function
+in this project, e.g. specialists/services.py's _future_appointments).
+Everything else here is a pure function over plain values, in particular
+_subtract_intervals, which knows nothing about TimeOff/WorkingHours/
+Appointment at all — the generalised blocking-interval list a future
+closure source would plug into without this function changing (6.D's
+Appointment support is exactly that plugging-in, not a rewrite).
 """
 
 import datetime as dt
@@ -21,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 from django.db.models import QuerySet
 
+from booking.models import ACTIVE_APPOINTMENT_STATUSES, Appointment
 from core.exceptions import InvalidDateRangeError
 from specialists.models import Specialist, TimeOff, WorkingHours
 
@@ -72,6 +75,17 @@ def _time_off_to_blocking_intervals(time_off_rows: Sequence[TimeOff]) -> list[Wi
     return [Window(row.start_datetime, row.end_datetime) for row in time_off_rows]
 
 
+def _appointments_to_blocking_intervals(appointment_rows: Sequence[Appointment]) -> list[Window]:
+    """
+    Mirrors _time_off_to_blocking_intervals exactly. The busy interval is
+    (start_datetime, blocked_until) — the same buffered interval the
+    Appointment exclusion constraint itself protects (docs/ARCHITECTURE.md
+    § 2, § 7), never the bare (start_datetime, end_datetime) service
+    interval (docs/DECISIONS.md § Stage 6.D decisions).
+    """
+    return [Window(row.start_datetime, row.blocked_until) for row in appointment_rows]
+
+
 def _subtract_intervals(
     windows: Sequence[Window], blocking_intervals: Sequence[Window]
 ) -> list[Window]:
@@ -119,6 +133,17 @@ def _fetch_time_off(
     )
 
 
+def _fetch_appointments(
+    specialist: Specialist, range_start_utc: dt.datetime, range_end_utc: dt.datetime
+) -> QuerySet[Appointment]:
+    return Appointment.objects.filter(
+        specialist=specialist,
+        status__in=ACTIVE_APPOINTMENT_STATUSES,
+        start_datetime__lt=range_end_utc,
+        blocked_until__gt=range_start_utc,
+    )
+
+
 def compute_open_windows(
     specialist: Specialist,
     date_from: dt.date,
@@ -128,8 +153,9 @@ def compute_open_windows(
     """
     A specialist's open windows over [date_from, date_to] (salon-local
     calendar dates, inclusive), as concrete UTC intervals: WorkingHours
-    rows localized and merged, minus TimeOff (docs/ARCHITECTURE.md § 6
-    step 1; docs/DECISIONS.md § Stage 6 / § Stage 6.C decisions).
+    rows localized and merged, minus TimeOff and existing appointments
+    (docs/ARCHITECTURE.md § 6 step 1; docs/DECISIONS.md § Stage 6 / §
+    Stage 6.C / § Stage 6.D decisions).
 
     salon_timezone is resolved into a zoneinfo.ZoneInfo here, once — this
     is therefore where an unresolvable timezone name surfaces as
@@ -166,6 +192,9 @@ def compute_open_windows(
         date_to + dt.timedelta(days=1), dt.time(0, 0), dt.time(0, 0), tz
     ).start
     time_off_rows = list(_fetch_time_off(specialist, range_start_utc, range_end_utc))
-    blocking_intervals = _time_off_to_blocking_intervals(time_off_rows)
+    appointment_rows = list(_fetch_appointments(specialist, range_start_utc, range_end_utc))
+    blocking_intervals = _time_off_to_blocking_intervals(
+        time_off_rows
+    ) + _appointments_to_blocking_intervals(appointment_rows)
 
     return _subtract_intervals(open_windows, blocking_intervals)
