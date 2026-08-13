@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     "accounts",
     "catalog",
     "specialists",
+    "scheduling",
     "booking",
     "payments",
     "notifications",
