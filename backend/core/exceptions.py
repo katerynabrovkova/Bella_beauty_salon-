@@ -63,6 +63,12 @@ class SpecialistHasFutureAppointmentsError(DomainError):
     )
 
 
+class InvalidDateRangeError(DomainError):
+    code = "invalid_date_range"
+    status_code = status.HTTP_400_BAD_REQUEST
+    default_message = "The requested date range is invalid."
+
+
 def _envelope(*, code: str, message: str, details: dict | None = None) -> dict:
     return {"error": {"code": code, "message": message, "details": details or {}}}
 

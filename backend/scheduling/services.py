@@ -1,0 +1,171 @@
+"""
+Stage 6.C — open-window computation (docs/ARCHITECTURE.md § 6 step 1;
+docs/DECISIONS.md § Stage 6 decisions and § Stage 6.C decisions).
+
+Functional-core / imperative-shell split: _fetch_working_hours and
+_fetch_time_off are the only two functions that touch the tenant-scoped
+ORM (and so are the only two that require tenant context to already be
+bound, via core.tenancy.tenant_context — they don't bind it themselves,
+same convention as every other service-layer function in this project,
+e.g. specialists/services.py's _future_appointments). Everything else here
+is a pure function over plain values, in particular _subtract_intervals,
+which knows nothing about TimeOff/WorkingHours/Appointment at all — the
+generalised blocking-interval list a future closure source would plug into
+without this function changing.
+"""
+
+import datetime as dt
+from collections.abc import Iterator, Sequence
+from typing import NamedTuple
+from zoneinfo import ZoneInfo
+
+from django.db.models import QuerySet
+
+from core.exceptions import InvalidDateRangeError
+from specialists.models import Specialist, TimeOff, WorkingHours
+
+
+class Window(NamedTuple):
+    start: dt.datetime
+    end: dt.datetime
+
+
+def _dates_in_range(date_from: dt.date, date_to: dt.date) -> Iterator[dt.date]:
+    current = date_from
+    while current <= date_to:
+        yield current
+        current += dt.timedelta(days=1)
+
+
+def _localize_window(date: dt.date, start_time: dt.time, end_time: dt.time, tz: ZoneInfo) -> Window:
+    start = dt.datetime.combine(date, start_time, tzinfo=tz).astimezone(dt.UTC)
+    end = dt.datetime.combine(date, end_time, tzinfo=tz).astimezone(dt.UTC)
+    return Window(start, end)
+
+
+def _merge_intervals(intervals: Sequence[Window]) -> list[Window]:
+    """
+    Merges overlapping AND touching intervals (one ends exactly where the
+    next begins) into one — docs/DECISIONS.md § Stage 6.C decisions,
+    "touching intervals merge."
+    """
+    if not intervals:
+        return []
+    ordered = sorted(intervals, key=lambda window: window.start)
+    merged = [ordered[0]]
+    for window in ordered[1:]:
+        last = merged[-1]
+        if window.start <= last.end:
+            if window.end > last.end:
+                merged[-1] = Window(last.start, window.end)
+        else:
+            merged.append(window)
+    return merged
+
+
+def _time_off_to_blocking_intervals(time_off_rows: Sequence[TimeOff]) -> list[Window]:
+    """
+    The only function that knows TimeOff specifically. A future closure
+    source gets its own adapter of this shape, feeding the same
+    _subtract_intervals below (docs/DECISIONS.md § Stage 6 decisions).
+    """
+    return [Window(row.start_datetime, row.end_datetime) for row in time_off_rows]
+
+
+def _subtract_intervals(
+    windows: Sequence[Window], blocking_intervals: Sequence[Window]
+) -> list[Window]:
+    """
+    Generalised subtraction — no knowledge of TimeOff, WorkingHours, or
+    Appointment. Half-open [start, end) boundaries throughout: a blocking
+    interval that only touches a window, without overlapping it, does not
+    clip it. Blocking intervals are merged first so the result never
+    depends on the order they're passed in, including when they overlap
+    each other (docs/DECISIONS.md § Stage 6.C decisions).
+    """
+    if not blocking_intervals:
+        return list(windows)
+
+    merged_blockers = _merge_intervals(blocking_intervals)
+    result: list[Window] = []
+    for window in windows:
+        remaining = [window]
+        for blocker in merged_blockers:
+            next_remaining: list[Window] = []
+            for piece in remaining:
+                if blocker.end <= piece.start or blocker.start >= piece.end:
+                    next_remaining.append(piece)
+                    continue
+                if blocker.start > piece.start:
+                    next_remaining.append(Window(piece.start, blocker.start))
+                if blocker.end < piece.end:
+                    next_remaining.append(Window(blocker.end, piece.end))
+            remaining = next_remaining
+        result.extend(remaining)
+    return result
+
+
+def _fetch_working_hours(specialist: Specialist) -> QuerySet[WorkingHours]:
+    return WorkingHours.objects.filter(specialist=specialist)
+
+
+def _fetch_time_off(
+    specialist: Specialist, range_start_utc: dt.datetime, range_end_utc: dt.datetime
+) -> QuerySet[TimeOff]:
+    return TimeOff.objects.filter(
+        specialist=specialist,
+        start_datetime__lt=range_end_utc,
+        end_datetime__gt=range_start_utc,
+    )
+
+
+def compute_open_windows(
+    specialist: Specialist,
+    date_from: dt.date,
+    date_to: dt.date,
+    salon_timezone: str,
+) -> list[Window]:
+    """
+    A specialist's open windows over [date_from, date_to] (salon-local
+    calendar dates, inclusive), as concrete UTC intervals: WorkingHours
+    rows localized and merged, minus TimeOff (docs/ARCHITECTURE.md § 6
+    step 1; docs/DECISIONS.md § Stage 6 / § Stage 6.C decisions).
+
+    salon_timezone is resolved into a zoneinfo.ZoneInfo here, once — this
+    is therefore where an unresolvable timezone name surfaces as
+    zoneinfo.ZoneInfoNotFoundError, deliberately, not from a helper several
+    calls deep (docs/DECISIONS.md § Stage 6.C decisions).
+
+    Requires tenant context to already be bound (core.tenancy.tenant_context)
+    — this function does not bind it itself; see the module docstring.
+
+    Excludes duration, buffer, granularity, lead time, and the advance
+    window entirely — those are later substages.
+    """
+    if date_from > date_to:
+        raise InvalidDateRangeError(
+            f"date_from ({date_from}) must not be after date_to ({date_to})."
+        )
+
+    if not specialist.is_active:
+        return []
+
+    tz = ZoneInfo(salon_timezone)
+
+    working_hours_rows = list(_fetch_working_hours(specialist))
+    raw_windows = [
+        _localize_window(date, row.start_time, row.end_time, tz)
+        for date in _dates_in_range(date_from, date_to)
+        for row in working_hours_rows
+        if row.day_of_week == date.weekday()
+    ]
+    open_windows = _merge_intervals(raw_windows)
+
+    range_start_utc = _localize_window(date_from, dt.time(0, 0), dt.time(0, 0), tz).start
+    range_end_utc = _localize_window(
+        date_to + dt.timedelta(days=1), dt.time(0, 0), dt.time(0, 0), tz
+    ).start
+    time_off_rows = list(_fetch_time_off(specialist, range_start_utc, range_end_utc))
+    blocking_intervals = _time_off_to_blocking_intervals(time_off_rows)
+
+    return _subtract_intervals(open_windows, blocking_intervals)

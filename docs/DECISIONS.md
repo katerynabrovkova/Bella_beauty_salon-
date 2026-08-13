@@ -86,6 +86,16 @@ on them, rather than being forgotten and improvised in the moment.
   closing time," so a specialist who finishes before the salon closes
   doesn't lose a slot needlessly. Revisit alongside the closure model
   decision.
+- **`Salon.timezone` write-time validation.** Nothing currently validates
+  that `Salon.timezone` is a real IANA zone name at write time (model,
+  serializer, or admin form) — a malformed value would only surface as an
+  unhandled `zoneinfo.ZoneInfoNotFoundError` the first time
+  `scheduling.compute_open_windows` tries to resolve it (§ Stage 6
+  decisions), from the orchestrator specifically, by deliberate placement —
+  not read-time defended against there either. Needs a decision on where the
+  validation belongs, and whether a bad existing value should be caught and
+  translated into a clearer error or left as an uncaught 500, since it would
+  indicate corrupted configuration data, not user input.
 
 ## Overall style
 
@@ -936,3 +946,97 @@ decisions, not as notes written after the fact.
   to happen at window construction, before subtraction and slot-walking even
   start, not only when converting the final candidate slots back to local
   time for the response.
+
+### Stage 6.C decisions (open-window computation — design addendum)
+
+Decided 2026-08-13, before implementation, resolving the open questions raised
+by the 6.C design proposal.
+
+- **`compute_open_windows`'s `date_from`/`date_to` are salon-local calendar
+  dates (`dt.date`), not UTC instants.** Reasoning: a customer asks "what's
+  free on 15 September" in salon-local terms — accepting UTC instants here
+  would push a day-boundary explanation into every layer above
+  `compute_open_windows` (the composition function, the eventual `GET`
+  endpoint, the frontend) instead of settling it once, at the one place that
+  already has to reason about salon-local wall-clock time (`WorkingHours`
+  itself).
+- **`date_from > date_to` raises, rather than returning an empty list.**
+  Reasoning: an invalid range is a caller error, not a legitimate data state
+  — an empty list is indistinguishable from "genuinely nothing available,"
+  which would let a view-level bug (e.g. swapped query params) pass through
+  silently instead of surfacing. The eventual `GET` endpoint translates the
+  exception into a 400.
+- **`_subtract_intervals` must produce a result independent of
+  blocking-interval order, including when blockers overlap each other.**
+  Same reasoning already applied to `WorkingHours` above: nothing in the
+  schema prevents two overlapping `TimeOff` rows for the same specialist
+  either — no uniqueness constraint, no `clean()` — so the generalised
+  subtraction step must tolerate that shape of input, not just the shape the
+  schema happens to make more common.
+- **The pure window/interval functions (`_merge_intervals`,
+  `_subtract_intervals`) use the same half-open `[start, end)` convention as
+  the `Appointment` exclusion constraint** — a window boundary that only
+  touches a blocker, without overlapping it, is not clipped. Reasoning: this
+  project already has one boundary convention, established for the exclusion
+  constraint (the "Interval boundaries — established fact" decision above);
+  running a second, different convention through the pure scheduling
+  functions would be a guaranteed off-by-one the moment the two are compared
+  or composed.
+- **`_merge_intervals` merges intervals that touch with zero gap (one ends
+  exactly where the next begins), not only intervals that strictly
+  overlap.** Two `WorkingHours` rows with no gap between them (e.g.
+  `09:00–12:50` and `12:50–18:00`) describe one continuous period of work —
+  how a shift happens to be split into rows is incidental data entry, not a
+  fact about the day. This matters concretely once slot-walking exists
+  (a later substage): with granularity 20 minutes, merging the two rows
+  above into one `09:00–18:00` window walks candidates `..., 12:40, 13:00,
+  ...`, while leaving them as two separate windows walks `..., 12:40 |
+  12:50, 13:10, ...` — a different candidate grid for the rest of the day,
+  entirely as a side effect of how the row happened to be split. An
+  incidental data-entry choice must not shift the whole day's slot grid.
+- **`is_active=False` specialist exclusion is guarded in two places, not
+  one: an early-return empty list inside `compute_open_windows`, and the
+  caller filtering its specialist list before calling in.** Mirrors this
+  project's existing serializer-plus-database-constraint pattern (e.g. the
+  tenant-scoped `validate_name` check backstopped by the database's own
+  `UniqueViolation` translation, § Stage 4 decisions) — the cheap local
+  check inside `compute_open_windows` costs one attribute access and stops a
+  forgetful caller from ever reaching the ORM queries at all, while the
+  caller-side filter is what actually matters for the multi-specialist
+  composition function's enumeration (§ Stage 6 decisions above) and avoids
+  spending a query on a specialist who can never have a window regardless.
+- **A malformed `Salon.timezone` (a string `zoneinfo.ZoneInfo` can't
+  resolve) is not handled inside `compute_open_windows` or
+  `_localize_window`.** Reasoning: validating that `Salon.timezone` is a
+  real IANA zone name is a write-time concern — it belongs wherever
+  `Salon.timezone` is created or edited, not on every read of every
+  availability computation. Recorded as an open question (§ Open questions)
+  rather than handled defensively here.
+- **Window/interval values are a `NamedTuple` (`Window(start: datetime, end:
+  datetime)`), not a bare `tuple[datetime, datetime]`, from the start of
+  Stage 6.C.** Reasoning: these values travel through multiple further
+  layers (6.D's busy-interval subtraction, the multi-specialist composition
+  function, and eventually a serializer) — `w[0]`/`w[1]` at the third or
+  fourth layer of composition is unreadable and error-prone (nothing stops
+  swapping start/end positionally), while `w.start`/`w.end` is
+  self-documenting at every layer. Decided now, rather than deferred as a
+  style choice, specifically so no downstream substage gets written against
+  the bare-tuple shape and then needs a mechanical rewrite.
+- **`salon_timezone` stays a `str` parameter on `compute_open_windows` and is
+  converted to a `zoneinfo.ZoneInfo` once, inside the orchestrator, before
+  being passed down to `_localize_window`.** Recorded here as a deliberate
+  placement, not an accident to be rediscovered while debugging: it means a
+  `zoneinfo.ZoneInfoNotFoundError` (an unresolvable timezone name — see the
+  malformed-`salon_timezone` decision above) surfaces from
+  `compute_open_windows` itself, not from a helper several calls deep.
+  `compute_open_windows`'s docstring states this explicitly.
+- **Stage 6.C's computation lives in `scheduling/services.py`, not a
+  separately-named module.** Matches this project's existing service-layer
+  convention (`catalog/services.py`, `specialists/services.py`) — naming
+  this one app's equivalent module something else would leave an
+  unexplained inconsistency about where business/computation logic lives
+  across apps, for no benefit.
+- **`date_from > date_to` raises `core.exceptions.InvalidDateRangeError`, a
+  new `DomainError` subclass.** Its HTTP-status/error-envelope mapping is
+  not decided now — that lands with the `GET`-endpoint substage, alongside
+  `docs/ARCHITECTURE.md` § 14's `EXCEPTION_HANDLER`.

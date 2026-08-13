@@ -7,7 +7,7 @@ from accounts.models import Customer
 from booking.models import Appointment, AppointmentStatus
 from catalog.models import Service, ServiceCategory
 from core.tenancy import tenant_context
-from specialists.models import Specialist
+from specialists.models import Specialist, TimeOff, WorkingHours
 from tenants.models import Salon
 
 
@@ -74,6 +74,42 @@ def customer(salon):
     with tenant_context(salon.id):
         return Customer.objects.create(
             salon=salon, name="Alice", email="alice@example.com", phone="+10000000000"
+        )
+
+
+def make_working_hours(
+    *,
+    salon: Salon,
+    specialist: Specialist,
+    day_of_week: int,
+    start_time: dt.time,
+    end_time: dt.time,
+) -> WorkingHours:
+    with tenant_context(salon.id):
+        return WorkingHours.objects.create(
+            salon=salon,
+            specialist=specialist,
+            day_of_week=day_of_week,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+
+def make_time_off(
+    *,
+    salon: Salon,
+    specialist: Specialist,
+    start_datetime: dt.datetime,
+    end_datetime: dt.datetime,
+    reason: str = "",
+) -> TimeOff:
+    with tenant_context(salon.id):
+        return TimeOff.objects.create(
+            salon=salon,
+            specialist=specialist,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            reason=reason,
         )
 
 
