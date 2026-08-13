@@ -22,8 +22,8 @@ sync if the order ever changes.
 1. Detailed backend architecture, written to `docs/ARCHITECTURE.md`, no code (done)
 2. Domain models + migrations (done)
 3. Auth, roles, tenant isolation, guest identity (done)
-4. Catalog (categories, services)
-5. Specialists — full CRUD (read public, writes gated by IsSalonStaff — same split as Stage 4 catalog)
+4. Catalog (categories, services) (done)
+5. Specialists — full CRUD (read public, writes gated by IsSalonStaff — same split as Stage 4 catalog) (done)
 6. Availability engine — pure slot computation, read-only, heavily unit-tested
 7. Booking core — creation, statuses, cancellation, concurrency
 8. Payments — provider abstraction, deposit, webhooks, refunds
@@ -67,6 +67,25 @@ on them, rather than being forgotten and improvised in the moment.
   commits) and Stage 5 explicitly leaves it out. Needs a decision — image
   storage/CDN choice, who is allowed to upload, whether it's required or
   optional per specialist — before the frontend specialist pages (Stage 13).
+- **Salon-level closure/holiday model.** No salon-wide closure exists today —
+  only per-specialist `TimeOff` (§ Stage 6 decisions). Needed before the
+  admin calendar stage (Stage 19/20), which is where staff would actually
+  declare a closure.
+- **Overlap-prevention validation on `WorkingHours`.** Nothing today stops
+  two overlapping rows for the same specialist/day being saved (no
+  uniqueness constraint, no `clean()`, admin-writable) — the availability
+  engine defends itself by merging overlapping rows at ingestion time (§
+  Stage 6 decisions), but the write side has no equivalent guard. Add
+  validation when `WorkingHours` gains a real write API (Stage 20); until
+  then the merge is the only protection.
+- **Buffer-at-shift-end rule revisit.** Stage 6 requires the buffer to fit
+  inside the specialist's own working window (§ Stage 6 decisions), because
+  no salon-level closing time exists yet to compare against. Once salon
+  working hours (or the closure model above) exist, the rule should become
+  "buffer must fit before the earlier of specialist shift end and salon
+  closing time," so a specialist who finishes before the salon closes
+  doesn't lose a slot needlessly. Revisit alongside the closure model
+  decision.
 
 ## Overall style
 
@@ -802,3 +821,118 @@ decisions, not as notes written after the fact.
   tenant-scoped queryset check, never from the database constraint underneath
   it. This applies to every future `many=True` tenant-scoped relation, not only
   `services`.
+
+## Stage 6 decisions (availability engine)
+
+Decided 2026-08-13, before implementation — recorded here as agreed-in-advance
+decisions, not as notes written after the fact.
+
+- **Buffer at the end of a shift: the buffer must fit inside the specialist's
+  working window, not spill past it.** The last bookable start time for a
+  window is `window_end − service.duration_minutes − service.buffer_minutes`.
+  Reasoning: the salon physically closes at the end of the shift; a buffer
+  extending past window end would require the specialist to do
+  equipment/room turnaround in a building that's already locked — the buffer
+  is real time someone needs, not a bookkeeping convenience that can slide
+  past closing. Rejected alternative: letting the buffer spill past window
+  end, which gains exactly one extra slot per specialist per day but assumes
+  the premises stay open past the nominal closing time — an assumption
+  nothing else in this project makes. Consequence worth stating explicitly
+  because it's easy to get wrong in a test: the last slot of a day is not
+  necessarily on a round slot-granularity boundary from window start — e.g. a
+  shift ending at 21:00, a 60-minute service with a 15-minute buffer, gives a
+  last bookable start of 19:45, not 20:00 or 20:15.
+- **Overlapping `WorkingHours` rows are merged into disjoint windows at
+  ingestion time (window-building), not deduplicated at output.**
+  Reasoning: nothing in the schema or the write path prevents two overlapping
+  rows for the same specialist/day today — no uniqueness constraint, no
+  `clean()`, and the rows are already admin-writable
+  (`specialists/admin.py`'s `WorkingHoursAdmin`, plain `SalonScopedAdmin`, no
+  overlap check) — so the engine must tolerate the data as it actually can
+  exist, not as it ideally would. A duplicated slot surfacing in an API
+  response because two overlapping rows both generated it independently is a
+  **wrong answer** (the caller sees the same start time twice, or double-
+  counts it in a merge elsewhere), not merely wasted computation. Rejected
+  alternative: deduplicating identical slots at the output stage instead —
+  rejected because it requires two mechanisms (a merge-shaped one at output,
+  doing the same job the window-building step could do once) where one at the
+  source suffices, and because dedup-at-output has to reason about slot
+  *equality* after the fact instead of window *disjointness* before the fact,
+  a strictly harder invariant to get right. Split shifts — two genuinely
+  non-overlapping `WorkingHours` rows for the same day, with a lunch break
+  represented as the absence of a row between them, per the model's own
+  docstring — are unaffected: merging only ever acts on rows that actually
+  overlap.
+- **Salon-level closure (public holidays, planned shutdowns) is not modelled
+  in Stage 6.** Recorded instead as an open question (§ Open questions,
+  below). Reasoning: the real requirement doesn't decompose into one shape —
+  it's at minimum one-off closures, annually-recurring holidays, partial-day
+  closures, and eventually per-room rather than per-salon closures — and a
+  minimal model built now to unblock Stage 6 would almost certainly be
+  rewritten, with a data migration, once the real requirement is scoped
+  properly (likely alongside the admin calendar work, Stage 19/20). **This
+  has a consequent design requirement for Stage 6 itself, not just a
+  deferral note:** the window-building step's blocking-interval subtraction
+  must accept a generalised list of blocking intervals, not be hardcoded to
+  read `TimeOff` specifically, so a future closure source becomes one
+  additional entry in that list rather than a rewrite of the subtraction
+  logic. See `docs/ARCHITECTURE.md` § 6 for the corresponding wording.
+- **Interval boundaries — established fact, not a decision.** Postgres's
+  `TSTZRANGE(a, b)` with the bounds argument omitted defaults to `'[)'` —
+  inclusive lower bound, exclusive upper bound. The exclusion constraint
+  (`booking/models.py`'s `appointment_no_overlapping_active_bookings`) uses
+  exactly this two-argument form, so a candidate starting exactly at a
+  previous appointment's `blocked_until` does not overlap it and is free.
+  This isn't a new decision — § Business rules already states "a following
+  appointment may start exactly when the buffer ends," and it's already
+  covered by a passing test,
+  `test_back_to_back_appointment_after_buffer_is_allowed`
+  (`tests/test_booking_exclusion_constraint.py`) — recorded here only so the
+  availability engine's own slot-walking arithmetic is written to agree with
+  it deliberately, not by accident.
+- **Multi-specialist availability: both modes are required, as two
+  functions, not one.** The per-specialist function stays the primitive,
+  with the signature `docs/ARCHITECTURE.md` § 6 already documents (specialist
+  + service + date range). A separate, thin composition function in the same
+  `scheduling` app handles "any available specialist for this service": it
+  enumerates the service's `SpecialistService`-qualified, `is_active`
+  specialists and unions each one's per-specialist availability. Rejected
+  alternatives: (a) making `specialist` optional on the primitive itself —
+  rejected because it turns one function into two behaviors gated by whether
+  an argument is `None`, signature sprawl for what is really a distinct,
+  higher-level operation (fan-out + union) layered on top of the primitive,
+  not a variant of it; (b) leaving the fan-out to the frontend — rejected
+  because it turns "show me any available time for this service" into N HTTP
+  requests per page view (one per qualified specialist), which doesn't scale
+  with the number of specialists a salon employs and pushes a backend
+  concern onto every client.
+- **Response shape for the multi-specialist mode: each slot carries the list
+  of specialists available at that time, not a bare time.** Reasoning: in
+  the beauty-salon domain a specialist is not an interchangeable resource —
+  which specific person a customer gets matters to them — and the
+  composition function already has every qualified specialist's name in hand
+  while computing the union, so attaching it costs nothing extra. Collapsing
+  a list down to a bare time later, if some future caller only ever wants
+  "is anything free at 14:00," is trivial; reconstructing "who" after the
+  response has already thrown that information away is not.
+- **Stage 6 scope includes a read-only `GET` endpoint, not only the internal
+  `scheduling` service function.** Reasoning: where tenant context gets
+  bound for `TenantScopedManager` (`core.tenancy.tenant_context`, per
+  `docs/ARCHITECTURE.md` § 5) can only really be answered while an actual
+  view is being written against an actual request — designing the service
+  function's signature without ever exercising it through a view risks
+  getting that signature wrong and discovering it only once Stage 7 (already
+  the heaviest remaining stage) is underway and depending on it. The stage
+  title's "read-only" was originally ambiguous between "the computation has
+  no side effects" (true of the internal function regardless) and "there's a
+  `GET` endpoint" — this decision resolves it to mean both.
+- **DST handling belongs at the window-building step, not only at response
+  formatting.** `WorkingHours.start_time`/`end_time` are plain `TimeField`s
+  keyed by `day_of_week` — salon-local wall-clock time with no date attached.
+  Turning "09:00–18:00 on day X" into a concrete UTC interval requires
+  localizing against a specific calendar date via `zoneinfo`, and on a
+  DST-transition day that localization changes the real UTC duration of the
+  window (8 or 10 hours, not the naive 9) — so the DST-aware conversion has
+  to happen at window construction, before subtraction and slot-walking even
+  start, not only when converting the final candidate slots back to local
+  time for the response.

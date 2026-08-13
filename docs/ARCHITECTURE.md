@@ -254,8 +254,13 @@ local-time display); the current time.
 **Algorithm shape** (pure, no side effects): for a given specialist + service + date
 range —
 
-1. Build the specialist's open windows for the range from `WorkingHours`, minus any
-   overlapping `TimeOff`.
+1. Build the specialist's open windows for the range from `WorkingHours` —
+   overlapping rows for the same specialist/day are merged into disjoint windows
+   first — minus every overlapping interval from a generalised blocking-interval
+   list, subtracted in full whether it clips an edge, splits the window, or
+   covers it entirely (currently just `TimeOff`; a future closure source is one
+   additional entry in that list, not a rewrite of this step — see
+   `docs/DECISIONS.md` § Stage 6 decisions and § Open questions).
 2. Subtract busy intervals from existing appointments in that range, using each
    appointment's `(start, blocked_until)` — the buffer is calendar-blocking time, so
    it occupies the busy interval exactly like the service itself does.
@@ -271,6 +276,12 @@ Concretely: a 90-minute service with a 15-minute buffer blocks 105 minutes of th
 specialist's calendar. The client is only ever offered the 90-minute window itself
 as a bookable start — never a start time that would fall inside someone else's
 buffer.
+
+**Multi-specialist composition:** the algorithm above always takes a specific
+specialist. A separate, thin composition function in the same `scheduling` app
+handles the case where no specialist is specified — it enumerates the service's
+`SpecialistService`-qualified, active specialists and unions each one's
+per-specialist availability (`docs/DECISIONS.md` § Stage 6 decisions).
 
 **Where it lives:** `scheduling`, as a stateless service function, not a persisted
 "slots" table. This is a deliberate correctness-over-performance call: a materialized
@@ -296,9 +307,14 @@ those writes, not a change in what the source of truth is.
   correct behavior, not a bug.
 - Specialists working across midnight — assumed not to happen (salons close
   nightly); flagged as an assumption, not built for.
-- DST transitions — timestamps are stored in UTC (per `docs/DECISIONS.md` §
-  Timezone); local-time slot boundaries are computed via `zoneinfo`, which is
-  DST-aware, at display time.
+- DST transitions — `WorkingHours.start_time`/`end_time` are salon-local
+  wall-clock time with no date attached, so building step 1's UTC windows
+  requires a DST-aware `zoneinfo` localization against the specific calendar
+  date being computed, not a fixed offset — the same DST-aware conversion
+  also applies when converting final candidate slots back to local time for
+  the response (step 5). Handling this only at display time and building
+  step 1's windows in naive UTC would be wrong on a transition day
+  (`docs/DECISIONS.md` § Stage 6 decisions).
 
 ## 7. Booking: transaction boundaries and double-booking prevention
 
