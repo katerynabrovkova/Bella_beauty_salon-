@@ -104,6 +104,35 @@ on them, rather than being forgotten and improvised in the moment.
   validation belongs, and whether a bad existing value should be caught and
   translated into a clearer error or left as an uncaught 500, since it would
   indicate corrupted configuration data, not user input.
+- **Lower-bound validation on `Salon.slot_granularity_minutes` and
+  `Service.duration_minutes` at the model level.** Today
+  `Service.duration_minutes >= 1` is enforced only in `catalog/serializers.py`
+  (`min_value=1`), not at the model/DB layer, and
+  `Salon.slot_granularity_minutes` has no lower-bound enforcement anywhere —
+  no serializer exists for `Salon` yet, and the admin form has no validator.
+  `scheduling._step_windows` (§ Stage 6.E decisions) now guards against
+  `granularity_minutes <= 0` / `occupied_minutes <= 0` at read time, but that
+  guard exists precisely because the write side has no equivalent one; the
+  real fix is closing the gap at the source. Needed by Stage 19/20, when
+  salon settings (and possibly `Service`) get a write API.
+- **`compute_candidate_start_times`'s `salon` argument is not checked
+  against `specialist.salon`.** (§ Stage 6.E decisions.) The orchestrator
+  takes `specialist: Specialist` and `salon: Salon` as two independent
+  parameters; nothing in `scheduling/services.py`, `TenantScopedManager`, or
+  anywhere else verifies the caller passed the specialist's actual salon.
+  Passing a mismatched `salon` would silently resolve
+  `granularity_minutes` from the wrong tenant's settings and localize the
+  specialist's real `WorkingHours` against the wrong tenant's timezone —
+  wrong output, not a crash, and nothing in the current test suite would
+  catch it either since query counts and return values would both look
+  superficially plausible. No guard added yet (deliberately, per the 6.E
+  design decision) — needs a decision on whether this belongs in 6.E itself
+  (e.g. `assert specialist.salon_id == salon.id`, or deriving `salon` from
+  `specialist.salon` after all and accepting the extra query) or stays
+  documented-only on the theory that every real caller already gets both
+  objects from the same tenant-scoped request context and could not produce
+  a mismatch without a bug elsewhere that unit tests on this function alone
+  wouldn't be positioned to catch regardless.
 
 ## Overall style
 
@@ -1105,3 +1134,143 @@ raised by the 6.D design proposal.
   admin calendar explaining *why* a slot is unavailable) can read
   `Appointment`/`TimeOff` rows directly rather than reconstructing them
   from derived slots, so the need is speculative, not demonstrated.
+
+### Stage 6.E decisions (slot stepping)
+
+Decided 2026-08-14, before implementation, resolving the open questions raised
+by the 6.E design proposal.
+
+- **Two layers, in `scheduling/services.py`, alongside the 6.C/6.D pure
+  functions and `compute_open_windows`:**
+
+  ```python
+  def _step_windows(
+      windows: Sequence[Window],
+      granularity_minutes: int,
+      occupied_minutes: int,
+  ) -> list[dt.datetime]: ...
+
+  def compute_candidate_start_times(
+      specialist: Specialist,
+      service: Service,
+      salon: Salon,
+      date_from: dt.date,
+      date_to: dt.date,
+  ) -> list[dt.datetime]: ...
+  ```
+
+  `_step_windows` is pure — plain numbers for `granularity_minutes`/
+  `occupied_minutes`, but still the `Window`/`dt.datetime` vocabulary
+  `_merge_intervals`/`_subtract_intervals` already use, not a further
+  reduction to bare numbers, which would break consistency with the rest of
+  the pure layer for no benefit. `compute_candidate_start_times` calls
+  `compute_open_windows` itself — the same shape already established for
+  the (not yet built) multi-specialist composition function, which the
+  Stage 6 decision on multi-specialist availability specifies as calling
+  the per-specialist primitive itself rather than receiving its results —
+  and resolves `occupied_minutes = service.duration_minutes +
+  service.buffer_minutes`, `granularity_minutes =
+  salon.slot_granularity_minutes`, then calls `_step_windows`. Rejected
+  alternative: the orchestrator receiving pre-computed `windows` as an
+  argument instead of calling `compute_open_windows` itself — rejected
+  because no caller in current or near-term scope (the GET endpoint, the
+  composition function) has a reason to compute windows and stepped slots
+  separately, and passing windows in would require every caller to keep
+  `specialist`/`date_from`/`date_to`/`salon` in sync across two call sites
+  instead of one, the same caller-must-remember-an-invariant shape this
+  project has already avoided elsewhere (`TenantScopedManager`, the
+  `is_active` double guard, § Stage 6.C decisions).
+- **Grid remainder: strict grid only, no off-grid last slot.**
+  `_step_windows` walks each window independently from `window.start` in
+  steps of `granularity_minutes`, keeping a candidate only while `candidate
+  + occupied_minutes <= window.end`; a tail shorter than one full step is
+  never offered, even when `occupied_minutes` would fit inside it.
+  Rejected alternative: additionally emitting `window.end -
+  occupied_minutes` as an explicit final candidate whenever it lands
+  off-grid. Rejected because it would make the primitive carry two rules
+  instead of one, and would produce visibly uneven spacing between the last
+  two candidates in what's ultimately a slot picker. The Stage 6 decision
+  on buffer-at-shift-end (§ Stage 6 decisions, "Buffer at the end of a
+  shift") is not evidence for the rejected alternative, despite reading
+  that way out of context: its example — a window starting 09:00, a
+  60-minute service with a 15-minute buffer, "last bookable start of
+  19:45" — sits on the strict grid already. 19:45 is 645 minutes after
+  09:00; at the salon's default `slot_granularity_minutes` of 15, 645 / 15
+  = 43 exactly, so 19:45 is step 43 from window start, not an off-grid
+  value the strict rule would have to special-case. That decision was
+  recorded before slot-stepping was designed at all, as a statement about
+  the *closed-form ceiling* on the last bookable start (`window_end -
+  occupied_minutes`), not a claim that this ceiling must always be offered
+  regardless of grid alignment. Recorded here explicitly so this isn't
+  re-opened by a future reader skimming that example out of context.
+- **`granularity_minutes <= 0` and `occupied_minutes <= 0` raise, inside
+  `_step_windows`, rather than being silently trusted.** A new
+  `DomainError` subclass, `InvalidSteppingParametersError` (`core/
+  exceptions.py`, `code = "invalid_stepping_parameters"`, `status_code =
+  500`), in the `DomainError`-subclass shape `InvalidDateRangeError` uses
+  (§ Stage 6.C decisions) but deliberately mapped to a different status:
+  `InvalidDateRangeError`'s `date_from > date_to` arrives in the request
+  itself, so 400 correctly tells the client their input was malformed and
+  fixable by sending a different request; `InvalidSteppingParametersError`
+  fires because a `Salon` or `Service` row already in the database is
+  misconfigured (§ Open questions, "Lower-bound validation on
+  `Salon.slot_granularity_minutes`..." above) — the request that triggered
+  it may be perfectly well-formed, the client has nothing to change, and
+  telling them otherwise sends the frontend into a dead end. 500 is
+  correct here precisely because it is server misconfiguration, not caller
+  error, despite both being `DomainError` subclasses raised from the same
+  service layer. This mapping is recorded now but not implemented in 6.E —
+  same as `InvalidDateRangeError`'s own HTTP mapping (§ Stage 6.C
+  decisions), it lands with the `GET`-endpoint substage, alongside
+  `docs/ARCHITECTURE.md` § 14's `EXCEPTION_HANDLER`. Reasoning this needs a
+  guard at all, rather than trusting the schema like `_subtract_intervals`
+  trusts
+  well-formed `Window`s: `Service.duration_minutes >= 1` is enforced only
+  by `catalog/serializers.py` (`min_value=1`), not at the model/DB layer,
+  and `Salon.slot_granularity_minutes` has no lower-bound enforcement
+  anywhere yet — no `Salon` serializer exists, and the admin form has no
+  validator. `granularity_minutes = 0` is therefore creatable through
+  `/admin/` today, and the naive stepping loop (`candidate +=
+  timedelta(minutes=granularity_minutes)`) would not raise or return wrong
+  data on such a row — it would hang the request (or Celery task, or AI
+  assistant tool call) indefinitely. That failure mode is categorically
+  worse than the other three options this project already guards against
+  (silent wrong data, a loud crash, or a clear domain error), so it gets
+  the same treatment `InvalidDateRangeError` gets rather than being left
+  for the write-side validation this project doesn't have yet (tracked
+  as an open question below, and § Open questions above).
+- **`occupied_minutes` larger than every open window in range returns an
+  empty list, not an exception.** Already implied by
+  `docs/ARCHITECTURE.md` § 6's existing edge-case note ("a service
+  duration longer than any single open window never produces a slot —
+  correct behavior, not a bug"); this decision only confirms
+  `compute_candidate_start_times` follows that same rule rather than
+  treating "nothing available" as an error condition. No `_step_windows`
+  or `compute_candidate_start_times` code change is implied beyond what §
+  Grid remainder above already describes — a window that can't fit even
+  one candidate simply contributes none, the same as a window with a
+  0-minute-wide tail.
+- **`compute_candidate_start_times` takes `salon: Salon` as an explicit
+  parameter, not derived from `specialist.salon`.** Rejected alternative:
+  deriving `salon = specialist.salon` inside the orchestrator, which would
+  save one constructor argument. Rejected because it's a lazy FK access —
+  firing a fourth query, on first attribute touch, on top of the three
+  `compute_open_windows` already issues and that `django_assert_num_queries
+  (3)` pins (§ Stage 6.D decisions) — and because it would happen silently,
+  inside a function whose entire job is translating already-resolved model
+  objects into numbers; if that's the job, it should receive the objects it
+  translates rather than reach for one of them itself. With `salon` passed
+  in, `compute_candidate_start_times` itself issues zero queries of its own
+  (pure resolution plus the `compute_open_windows` call), so the pinned
+  query count is unaffected by this substage. `compute_open_windows`'s own
+  signature is unchanged — the orchestrator passes `salon.timezone` into it
+  as the existing `salon_timezone: str` parameter, forwarding rather than
+  re-deciding that convention (§ Stage 6.C decisions).
+- **`ARCHITECTURE.md` § 6 step 3 wording is unchanged.** The strict-grid
+  remainder rule, the `InvalidSteppingParametersError` guard, and the exact
+  function signatures above are Catalog-precedent detail (`docs/DECISIONS.md`
+  § Stage 4 decisions' endpoint lists and exception classes never
+  appearing in `ARCHITECTURE.md`) — they belong only here, not folded into
+  `ARCHITECTURE.md`'s "what" description of step 3, which already covers
+  slot-granularity stepping and the full-duration-plus-buffer requirement
+  at the right altitude and needs no addition for this substage.
