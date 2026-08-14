@@ -21,6 +21,15 @@ granularity_minutes/occupied_minutes, the Window/dt.datetime vocabulary
 otherwise) and compute_candidate_start_times (the thin orchestrator, which
 calls compute_open_windows itself rather than receiving windows as an
 argument — docs/DECISIONS.md § Stage 6.E decisions).
+
+6.F adds booking-window filtering on top of _step_windows's output, again
+without changing it: _filter_candidates_by_booking_window (pure — plain
+dt.datetime bounds, no knowledge of lead time, max advance, or timezones of
+its own) and _max_advance_boundary (pure — the calendar-boundary arithmetic,
+taking an already-resolved ZoneInfo rather than resolving one itself).
+compute_candidate_start_times gains a required `now: dt.datetime` parameter
+with no default, validated on its first line (docs/DECISIONS.md § Stage 6.F
+decisions).
 """
 
 import datetime as dt
@@ -29,6 +38,7 @@ from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 from django.db.models import QuerySet
+from django.utils import timezone
 
 from booking.models import ACTIVE_APPOINTMENT_STATUSES, Appointment
 from catalog.models import Service
@@ -248,18 +258,53 @@ def _step_windows(
     return candidates
 
 
+def _filter_candidates_by_booking_window(
+    candidates: Sequence[dt.datetime],
+    lower_bound: dt.datetime,
+    upper_bound: dt.datetime,
+) -> list[dt.datetime]:
+    """
+    Keeps a candidate only when `lower_bound <= candidate < upper_bound` —
+    half-open [), consistent with the rest of the engine. No knowledge of
+    lead time, max advance, or timezones of its own; both bounds arrive
+    already computed (docs/DECISIONS.md § Stage 6.F decisions).
+    """
+    return [candidate for candidate in candidates if lower_bound <= candidate < upper_bound]
+
+
+def _max_advance_boundary(now: dt.datetime, max_advance_days: int, tz: ZoneInfo) -> dt.datetime:
+    """
+    The exclusive upper bound of the booking window: midnight at the start
+    of the day following (today's salon-local date + max_advance_days), in
+    the salon's timezone, converted to UTC (docs/DECISIONS.md § Stage 6.F
+    decisions). An inlined two-line body, not a call to
+    `_localize_window(...).start` — same reasoning recorded there: identical
+    arithmetic, but this is a single cutoff instant, not a working-hours
+    Window that happens to have zero width.
+
+    Does not defend against a salon timezone whose DST transition lands
+    exactly on local midnight (docs/DECISIONS.md § Open questions,
+    "Max-advance boundary computed as local midnight can land on a
+    non-existent local time") — deliberately unresolved; see that entry.
+    """
+    boundary_date = now.astimezone(tz).date() + dt.timedelta(days=max_advance_days + 1)
+    return dt.datetime.combine(boundary_date, dt.time(0, 0), tzinfo=tz).astimezone(dt.UTC)
+
+
 def compute_candidate_start_times(
     specialist: Specialist,
     service: Service,
     salon: Salon,
     date_from: dt.date,
     date_to: dt.date,
+    now: dt.datetime,
 ) -> list[dt.datetime]:
     """
     A specialist's candidate start times for a service, over
-    [date_from, date_to] (docs/ARCHITECTURE.md § 6 step 3;
-    docs/DECISIONS.md § Stage 6.E decisions). Calls compute_open_windows
-    itself rather than receiving windows as an argument, then resolves
+    [date_from, date_to], filtered to the salon's booking window
+    (docs/ARCHITECTURE.md § 6 step 3; docs/DECISIONS.md § Stage 6.E
+    decisions, § Stage 6.F decisions). Calls compute_open_windows itself
+    rather than receiving windows as an argument, then resolves
     occupied_minutes from service.duration_minutes + service.buffer_minutes
     and granularity_minutes from salon.slot_granularity_minutes — two
     different models — before calling _step_windows. `salon` is taken as an
@@ -267,15 +312,24 @@ def compute_candidate_start_times(
     specifically so this function issues no queries of its own beyond the
     three compute_open_windows already does (docs/DECISIONS.md § Stage 6.D
     decisions' django_assert_num_queries(3); a lazy specialist.salon access
-    would have added a fourth). Not checked against specialist.salon — see
-    docs/DECISIONS.md § Open questions.
+    would have added a fourth — salon.min_lead_time_hours,
+    salon.max_advance_days, and salon.timezone are all plain columns on the
+    already-loaded row, so booking-window filtering adds none either). Not
+    checked against specialist.salon — see docs/DECISIONS.md § Open
+    questions.
+
+    `now` has no default and is validated first: a naive value raises
+    ValueError immediately, before compute_open_windows or anything else
+    runs (docs/DECISIONS.md § Stage 6.F decisions).
 
     Requires tenant context to already be bound (core.tenancy.tenant_context),
     same as compute_open_windows — this function does not bind it itself.
 
-    Excludes lead time, the max-advance window, and conversion to
-    salon-local time entirely — those are later substages.
+    Excludes conversion to salon-local time — that is a later substage.
     """
+    if timezone.is_naive(now):
+        raise ValueError("now must be a timezone-aware datetime.")
+
     windows = compute_open_windows(
         specialist=specialist,
         date_from=date_from,
@@ -284,6 +338,11 @@ def compute_candidate_start_times(
     )
     occupied_minutes = service.duration_minutes + service.buffer_minutes
     granularity_minutes = salon.slot_granularity_minutes
-    return _step_windows(
+    candidates = _step_windows(
         windows, granularity_minutes=granularity_minutes, occupied_minutes=occupied_minutes
     )
+
+    lower_bound = now + dt.timedelta(hours=salon.min_lead_time_hours)
+    tz = ZoneInfo(salon.timezone)
+    upper_bound = _max_advance_boundary(now, salon.max_advance_days, tz)
+    return _filter_candidates_by_booking_window(candidates, lower_bound, upper_bound)

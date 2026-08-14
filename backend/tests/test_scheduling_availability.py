@@ -35,6 +35,17 @@ scheduling/services.py is written. Two layers, matching the functional-core
   collection again until scheduling/services.py gains these two names and
   core/exceptions.py gains InvalidSteppingParametersError — the same
   ModuleNotFoundError/ImportError shape as before 6.C/6.D existed.
+- 6.F adds two more pure functions alongside the ones above —
+  _filter_candidates_by_booking_window (plain dt.datetime bounds, no
+  knowledge of lead time, max advance, or timezones of its own) and
+  _max_advance_boundary (the calendar-boundary arithmetic, taking an
+  already-resolved ZoneInfo, docs/DECISIONS.md § Stage 6.F decisions) — and
+  extends compute_candidate_start_times with a required `now: dt.datetime`
+  parameter that has no default and raises ValueError immediately if it's
+  naive. This file is expected to fail on collection again until
+  scheduling/services.py gains the two new names and
+  compute_candidate_start_times gains the `now` parameter — the same
+  ModuleNotFoundError/ImportError shape as before 6.C/6.D/6.E existed.
 """
 
 import datetime as dt
@@ -49,7 +60,9 @@ from core.exceptions import InvalidDateRangeError, InvalidSteppingParametersErro
 from core.tenancy import tenant_context
 from scheduling.services import (
     Window,
+    _filter_candidates_by_booking_window,
     _localize_window,
+    _max_advance_boundary,
     _merge_intervals,
     _step_windows,
     _subtract_intervals,
@@ -408,6 +421,97 @@ def test_step_windows_both_non_positive_at_once_still_raises_a_single_error():
     """Neither check may assume the other field is well-formed first."""
     with pytest.raises(InvalidSteppingParametersError):
         _step_windows([WINDOW], granularity_minutes=0, occupied_minutes=-5)
+
+
+# --- _filter_candidates_by_booking_window (6.F) ----------------------------
+
+
+def test_filter_candidates_by_booking_window_empty_input_returns_empty():
+    assert _filter_candidates_by_booking_window([], _t(9), _t(18)) == []
+
+
+def test_filter_candidates_by_booking_window_candidate_before_lower_bound_excluded():
+    assert _filter_candidates_by_booking_window([_t(8, 59)], _t(9), _t(18)) == []
+
+
+def test_filter_candidates_by_booking_window_candidate_at_lower_bound_included():
+    """Decision 2 (§ Stage 6.F decisions): `candidate >= lower_bound` — inclusive."""
+    assert _filter_candidates_by_booking_window([_t(9)], _t(9), _t(18)) == [_t(9)]
+
+
+def test_filter_candidates_by_booking_window_candidate_at_upper_bound_excluded():
+    """
+    Decision 3 (§ Stage 6.F decisions): `candidate < upper_bound` — exclusive,
+    half-open [), consistent with the rest of the engine.
+    """
+    assert _filter_candidates_by_booking_window([_t(18)], _t(9), _t(18)) == []
+
+
+def test_filter_candidates_by_booking_window_candidate_just_before_upper_bound_included():
+    assert _filter_candidates_by_booking_window([_t(17, 59)], _t(9), _t(18)) == [_t(17, 59)]
+
+
+def test_filter_candidates_by_booking_window_candidate_after_upper_bound_excluded():
+    assert _filter_candidates_by_booking_window([_t(19)], _t(9), _t(18)) == []
+
+
+def test_filter_candidates_by_booking_window_mixed_list_preserves_surviving_order():
+    candidates = [_t(8), _t(9), _t(10), _t(17, 59), _t(18), _t(19)]
+    result = _filter_candidates_by_booking_window(candidates, _t(9), _t(18))
+    assert result == [_t(9), _t(10), _t(17, 59)]
+
+
+# --- _max_advance_boundary (6.F) --------------------------------------------
+
+
+def test_max_advance_boundary_ordinary_flat_offset_day():
+    """January — no DST in effect, Europe/Kyiv is a flat UTC+2 (mirrors
+    test_localize_window_ordinary_day_produces_correct_utc_offset)."""
+    now = dt.datetime(2026, 1, 15, 10, 0, tzinfo=UTC)  # local Kyiv 12:00, Jan 15
+    boundary = _max_advance_boundary(now, max_advance_days=5, tz=ZoneInfo("Europe/Kyiv"))
+    assert boundary == dt.datetime(2026, 1, 20, 22, 0, tzinfo=UTC)  # local midnight Jan 21, -2h
+
+
+def test_max_advance_boundary_zero_days_is_local_midnight_tomorrow():
+    now = dt.datetime(2026, 8, 17, 10, 0, tzinfo=UTC)  # local Kyiv 13:00 (EEST +3), Aug 17
+    boundary = _max_advance_boundary(now, max_advance_days=0, tz=ZoneInfo("Europe/Kyiv"))
+    assert boundary == dt.datetime(2026, 8, 17, 21, 0, tzinfo=UTC)  # local midnight Aug 18, -3h
+
+
+def test_max_advance_boundary_uses_salon_local_date_not_utc_date():
+    """
+    now is late enough in UTC that Kyiv's local date (UTC+3 in August) has
+    already rolled over to the next day — proves the function converts to
+    local time before taking .date(), not now.date() directly. A `now.date()`
+    implementation would compute boundary_date one day earlier than this,
+    landing on 2026-08-17 21:00 UTC instead — the same result as the previous
+    test, so this would silently pass with 2026-08-17's setup but not this
+    one's.
+    """
+    now = dt.datetime(2026, 8, 17, 23, 0, tzinfo=UTC)  # local Kyiv Aug 18, 02:00
+    boundary = _max_advance_boundary(now, max_advance_days=0, tz=ZoneInfo("Europe/Kyiv"))
+    assert boundary == dt.datetime(2026, 8, 18, 21, 0, tzinfo=UTC)  # local midnight Aug 19, -3h
+
+
+def test_max_advance_boundary_pins_current_behavior_on_nonexistent_local_midnight():
+    """
+    Pins CURRENT behaviour only — does not assert what it ought to do. §
+    Open questions ("Max-advance boundary computed as local midnight can land
+    on a non-existent local time") is recorded as deliberately unresolved;
+    this test exists so a future fix to that open question is a visible,
+    deliberate change to this assertion, not a silent one.
+
+    2026-09-06 is the day America/Santiago's local midnight does not exist
+    (spring-forward gap; verified against real tzdata via zoneinfo directly).
+    The inlined dt.datetime.combine(...).astimezone(UTC) body (§ Stage 6.F
+    decisions) defaults to fold=0, which resolves the gap using the
+    PRE-transition offset (-04:00) rather than raising — the same UTC instant
+    an ordinary, non-transition day would produce.
+    """
+    tz = ZoneInfo("America/Santiago")
+    now = dt.datetime(2026, 9, 5, 12, 0, tzinfo=UTC)  # local Santiago Sep 5, pre-transition
+    boundary = _max_advance_boundary(now, max_advance_days=0, tz=tz)
+    assert boundary == dt.datetime(2026, 9, 6, 4, 0, tzinfo=UTC)
 
 
 # --- compute_open_windows (integration, DB-backed) ------------------------
@@ -1354,6 +1458,7 @@ def test_compute_candidate_start_times_resolves_occupied_from_service_and_granul
         start_time=dt.time(9, 0),
         end_time=dt.time(11, 0),  # 120 minutes local; Aug in Europe/Kyiv is UTC+3
     )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)  # well before every candidate below
     with tenant_context(salon.id):
         result = compute_candidate_start_times(
             specialist=specialist,
@@ -1361,6 +1466,7 @@ def test_compute_candidate_start_times_resolves_occupied_from_service_and_granul
             salon=salon,
             date_from=monday,
             date_to=monday,
+            now=now,
         )
     start = dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC)
     assert result == [start + dt.timedelta(minutes=20 * k) for k in range(3)]  # 06:00, 06:20, 06:40
@@ -1392,6 +1498,7 @@ def test_compute_candidate_start_times_actually_calls_compute_open_windows(
         start_datetime=dt.datetime(2026, 8, 17, 7, 0, tzinfo=UTC),
         end_datetime=dt.datetime(2026, 8, 17, 7, 30, tzinfo=UTC),
     )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)  # well before every candidate below
     with tenant_context(salon.id):
         result = compute_candidate_start_times(
             specialist=specialist,
@@ -1399,6 +1506,7 @@ def test_compute_candidate_start_times_actually_calls_compute_open_windows(
             salon=salon,
             date_from=monday,
             date_to=monday,
+            now=now,
         )
     start = dt.datetime(2026, 8, 17, 7, 30, tzinfo=UTC)
     assert result == [start + dt.timedelta(minutes=15 * k) for k in range(6)]  # 07:30..08:45
@@ -1435,6 +1543,7 @@ def test_compute_candidate_start_times_issues_exactly_three_queries(
         service=service,
         start=dt.datetime(2026, 8, 17, 11, 0, tzinfo=UTC),
     )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
     with tenant_context(salon.id):
         with django_assert_num_queries(3):
             compute_candidate_start_times(
@@ -1443,6 +1552,7 @@ def test_compute_candidate_start_times_issues_exactly_three_queries(
                 salon=salon,
                 date_from=monday,
                 date_to=monday,
+                now=now,
             )
 
 
@@ -1450,6 +1560,7 @@ def test_compute_candidate_start_times_specialist_with_no_working_hours_returns_
     salon, specialist, service
 ):
     monday = dt.date(2026, 8, 17)
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
     with tenant_context(salon.id):
         result = compute_candidate_start_times(
             specialist=specialist,
@@ -1457,6 +1568,7 @@ def test_compute_candidate_start_times_specialist_with_no_working_hours_returns_
             salon=salon,
             date_from=monday,
             date_to=monday,
+            now=now,
         )
     assert result == []
 
@@ -1474,6 +1586,7 @@ def test_compute_candidate_start_times_non_positive_salon_granularity_raises(
         start_time=dt.time(9, 0),
         end_time=dt.time(18, 0),
     )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
     with tenant_context(salon.id), pytest.raises(InvalidSteppingParametersError):
         compute_candidate_start_times(
             specialist=specialist,
@@ -1481,6 +1594,7 @@ def test_compute_candidate_start_times_non_positive_salon_granularity_raises(
             salon=salon,
             date_from=monday,
             date_to=monday,
+            now=now,
         )
 
 
@@ -1496,6 +1610,7 @@ def test_compute_candidate_start_times_date_from_after_date_to_raises_invalid_da
             salon=salon,
             date_from=dt.date(2026, 8, 20),
             date_to=dt.date(2026, 8, 15),
+            now=dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC),
         )
 
 
@@ -1519,6 +1634,7 @@ def test_compute_candidate_start_times_inactive_specialist_returns_empty(
             salon=salon,
             date_from=monday,
             date_to=monday,
+            now=dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC),
         )
     assert result == []
 
@@ -1541,6 +1657,7 @@ def test_compute_candidate_start_times_occupied_minutes_larger_than_every_window
         start_time=dt.time(9, 0),
         end_time=dt.time(9, 30),  # 30 minutes local, shorter than occupied_minutes=75
     )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
     with tenant_context(salon.id):
         result = compute_candidate_start_times(
             specialist=specialist,
@@ -1548,6 +1665,7 @@ def test_compute_candidate_start_times_occupied_minutes_larger_than_every_window
             salon=salon,
             date_from=monday,
             date_to=monday,
+            now=now,
         )
     assert result == []
 
@@ -1577,6 +1695,7 @@ def test_compute_candidate_start_times_full_ordering_across_multiple_days(
             start_time=dt.time(9, 0),
             end_time=dt.time(12, 0),  # 180 minutes local -> 06:00-09:00 UTC
         )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
     with tenant_context(salon.id):
         result = compute_candidate_start_times(
             specialist=specialist,
@@ -1584,6 +1703,7 @@ def test_compute_candidate_start_times_full_ordering_across_multiple_days(
             salon=salon,
             date_from=monday,
             date_to=wednesday,
+            now=now,
         )
     monday_start = dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC)
     wednesday_start = dt.datetime(2026, 8, 19, 6, 0, tzinfo=UTC)
@@ -1591,3 +1711,252 @@ def test_compute_candidate_start_times_full_ordering_across_multiple_days(
         wednesday_start + dt.timedelta(minutes=15 * k) for k in range(8)
     ]
     assert result == expected
+
+
+# --- compute_candidate_start_times + booking-window filtering (6.F) --------
+
+
+def test_compute_candidate_start_times_filters_out_candidates_before_lead_time(
+    salon, specialist, service
+):
+    """
+    Proves salon.min_lead_time_hours is actually read and applied, not
+    ignored — window is 06:00-10:00 UTC (240 min local 09:00-13:00), which at
+    granularity 15 / occupied 75 gives 12 raw candidates (06:00..08:45,
+    mirrors the 6.E delegation test's own count). now is pinned to window
+    start with a 2-hour lead time, so only candidates from 08:00 on survive.
+    """
+    salon.min_lead_time_hours = 2
+    salon.save(update_fields=["min_lead_time_hours"])
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(13, 0),
+    )
+    now = dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC)  # window start
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    start = dt.datetime(2026, 8, 17, 8, 0, tzinfo=UTC)
+    assert result == [start + dt.timedelta(minutes=15 * k) for k in range(4)]  # 08:00..08:45
+
+
+def test_compute_candidate_start_times_filters_out_candidates_beyond_max_advance(
+    salon, specialist, service
+):
+    """
+    Proves salon.max_advance_days (together with salon.timezone) is actually
+    read and applied. Monday and Wednesday each get an identical shift
+    (06:00-09:00 UTC, 8 candidates apiece — same setup as the full-ordering
+    test above). max_advance_days=1 with `now` early Monday puts the boundary
+    at local midnight Kyiv Aug 19 (UTC Aug 18 21:00) — after every Monday
+    candidate but before every Wednesday one, so only Monday survives.
+    """
+    salon.max_advance_days = 1
+    salon.save(update_fields=["max_advance_days"])
+    monday = dt.date(2026, 8, 17)
+    wednesday = monday + dt.timedelta(days=2)
+    for day in (monday, wednesday):
+        make_working_hours(
+            salon=salon,
+            specialist=specialist,
+            day_of_week=day.weekday(),
+            start_time=dt.time(9, 0),
+            end_time=dt.time(12, 0),  # 06:00-09:00 UTC
+        )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=wednesday,
+            now=now,
+        )
+    start = dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC)
+    assert result == [start + dt.timedelta(minutes=15 * k) for k in range(8)]  # Monday only
+
+
+def test_compute_candidate_start_times_zero_lead_time_keeps_candidate_at_now(
+    salon, specialist, service
+):
+    """min_lead_time_hours=0 means lower_bound == now exactly; the candidate
+    sitting exactly at now must still be kept (`candidate >= now + 0h`)."""
+    salon.min_lead_time_hours = 0
+    salon.save(update_fields=["min_lead_time_hours"])
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(13, 0),
+    )
+    now = dt.datetime(2026, 8, 17, 6, 15, tzinfo=UTC)  # the second of the 12 raw candidates
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    start = dt.datetime(2026, 8, 17, 6, 15, tzinfo=UTC)
+    assert result == [start + dt.timedelta(minutes=15 * k) for k in range(11)]  # 06:15..08:45
+
+
+def test_compute_candidate_start_times_zero_max_advance_still_allows_today(
+    salon, specialist, service
+):
+    """
+    max_advance_days=0 must not collapse to an empty bookable range — it
+    means "through the end of today" (boundary is local midnight tomorrow),
+    so every one of today's 12 raw candidates survives untouched.
+    """
+    salon.max_advance_days = 0
+    salon.save(update_fields=["max_advance_days"])
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(13, 0),
+    )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    start = dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC)
+    assert result == [start + dt.timedelta(minutes=15 * k) for k in range(12)]
+
+
+def test_compute_candidate_start_times_lead_time_swallows_entire_range_returns_empty(
+    salon, specialist, service
+):
+    """
+    Mirrors the existing "occupied_minutes larger than every window" and
+    docs/ARCHITECTURE.md § 6 edge-case convention: nothing available is not
+    an error condition. min_lead_time_hours=240 (10 days) pushes lower_bound
+    ten days past every candidate in range.
+    """
+    salon.min_lead_time_hours = 240
+    salon.save(update_fields=["min_lead_time_hours"])
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(13, 0),
+    )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    assert result == []
+
+
+def test_compute_candidate_start_times_now_after_requested_range_returns_empty(
+    salon, specialist, service
+):
+    """
+    A stale/already-elapsed range: `now` falls a full day after the
+    requested range, with salon's DEFAULT lead time and max advance
+    untouched — distinct from the lead-time-swallows test above, which
+    reaches the same empty result via an overridden, unusually long lead
+    time rather than a stale range. Both routes through the same comparison
+    are worth covering explicitly.
+    """
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(13, 0),
+    )
+    now = dt.datetime(2026, 8, 18, 0, 0, tzinfo=UTC)  # a day after the requested range
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    assert result == []
+
+
+def test_compute_candidate_start_times_now_well_before_range_all_candidates_survive(
+    salon, specialist, service
+):
+    """
+    The ordinary case — querying a future range today. `now` is more than
+    two weeks before the requested range, well inside the default 60-day
+    max-advance window and far past the default 3-hour lead time, so
+    filtering has no effect: proves `now` isn't accidentally coupled to
+    date_from/date_to, only to the two booking-window boundaries.
+    """
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(13, 0),
+    )
+    now = dt.datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    start = dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC)
+    assert result == [start + dt.timedelta(minutes=15 * k) for k in range(12)]
+
+
+def test_compute_candidate_start_times_naive_now_raises_value_error(salon, specialist, service):
+    """
+    § Stage 6.F decisions: naive `now` is rejected on the first line, before
+    compute_open_windows or anything else runs — no WorkingHours needed for
+    this test to be meaningful.
+    """
+    monday = dt.date(2026, 8, 17)
+    with tenant_context(salon.id), pytest.raises(ValueError):
+        compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=dt.datetime(2026, 8, 17, 6, 0),  # naive — no tzinfo
+        )
