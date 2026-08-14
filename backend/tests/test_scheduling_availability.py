@@ -1,7 +1,11 @@
 """
-Stage 6.C/6.D — open-window computation (docs/ARCHITECTURE.md § 6 step 1;
-docs/DECISIONS.md § Stage 6 decisions, § Stage 6.C decisions, § Stage 6.D
-decisions).
+Scheduling app's availability-engine test suite (docs/ARCHITECTURE.md § 6;
+docs/DECISIONS.md § Stage 6 decisions and its Stage 6.C/6.D/6.E addenda).
+Scoped to the availability engine as a whole, not to open-window computation
+specifically — open windows (§ 6 steps 1-2) are the only computation this
+file covers so far, but the filename and this docstring are deliberately not
+scoped narrower than that, so later substages' tests (e.g. 6.E's slot
+stepping) land in this same file rather than reopening where tests belong.
 
 Written against the agreed design before any implementation exists — this
 file is expected to fail on collection (ModuleNotFoundError) until
