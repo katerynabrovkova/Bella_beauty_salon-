@@ -132,12 +132,36 @@ on them, rather than being forgotten and improvised in the moment.
   documented-only on the theory that every real caller already gets both
   objects from the same tenant-scoped request context and could not produce
   a mismatch without a bug elsewhere that unit tests on this function alone
-  wouldn't be positioned to catch regardless.
+  wouldn't be positioned to catch regardless. **6.F widens the blast
+  radius:** a mismatched `salon` now also supplies the lead time and the
+  max-advance window, on top of granularity and timezone. Also, correct the
+  cost argument this entry originally implied: a guard does not cost a
+  fourth query — `specialist.salon_id` is a plain column on the
+  already-loaded row (verified in § Stage 6.F decisions), and only
+  `specialist.salon` (the lazy relation) would fire one. The affordability
+  objection therefore does not apply; what remains is a judgement call about
+  likelihood, not cost.
 - **Local-time presentation across a DST transition** — on a spring-forward
   day the candidate list jumps (…01:40, 02:00, 03:00, 03:20…) because 02:xx
   does not exist locally. Whether to show that as-is, label it, or suppress
   the affected candidates is a presentation decision belonging to the
   local-time formatting substage, not to stepping.
+- **Max-advance boundary computed as local midnight can land on a
+  non-existent local time.** (§ Stage 6.F decisions.) The boundary is
+  midnight at the start of the day following `today + max_advance_days`, in
+  the salon's timezone. In IANA zones whose DST transition happens exactly
+  at midnight (e.g. `America/Santiago`, `America/Havana`), that local
+  midnight does not exist on one day per year, and `zoneinfo` resolves a
+  non-existent local time by shifting rather than raising — so the boundary
+  would silently move by an hour for that salon on that day. Not defended
+  against now: `Salon.timezone` defaults to `Europe/Kyiv`, which transitions
+  at 03:00, not midnight. But `Salon.timezone` is already a per-salon field
+  accepting any zone string (§ `Salon.timezone` write-time validation,
+  above), so this does not require international expansion to trigger — a
+  single salon configured with such a zone is enough. This is a different
+  question from "Local-time presentation across a DST transition" directly
+  above, which is about what to *display*; this one is about where the
+  boundary silently *moves to*. Do not merge them.
 
 ## Overall style
 
@@ -1279,3 +1303,48 @@ by the 6.E design proposal.
   `ARCHITECTURE.md`'s "what" description of step 3, which already covers
   slot-granularity stepping and the full-duration-plus-buffer requirement
   at the right altitude and needs no addition for this substage.
+
+### Stage 6.F decisions (booking-window filtering)
+
+Decided 2026-08-14, before implementation. No separate 6.F design proposal
+preceded this section — these decisions came directly out of discussion and
+are recorded here as agreed, not resolved against a prior written proposal.
+
+- **`now` is an explicit parameter, with no default and no `None` fallback.**
+  The system clock is I/O, the same category as the ORM, and this project
+  already isolates I/O in the `_fetch_*` functions (§ Stage 6.C decisions). A
+  default would let a test silently omit it and go green for the wrong
+  reason — the same failure shape as the fixture collision found in 6.E.
+  `timezone.now()` is called exactly once, in the view, landing with the
+  `GET`-endpoint substage; until then, tests pass it explicitly.
+- **Minimum lead time is a duration.** A candidate is kept if `candidate >=
+  now + timedelta(hours=salon.min_lead_time_hours)`.
+- **Maximum advance is a calendar boundary, not a duration.** Compute today's
+  date in the salon's timezone, add `salon.max_advance_days`, and the
+  exclusive upper bound is midnight at the start of the *following* day in
+  the salon timezone, converted to UTC; a candidate is kept if `candidate <
+  boundary`. Half-open `[)`, consistent with the rest of the engine and with
+  `TSTZRANGE`. Rejected alternative: `now + timedelta(days=N)`. Rejected
+  because a rolling boundary moves continuously — a customer refreshing the
+  page at 23:00 sees a day that was not there at 01:00 — and because salon
+  staff reason about "60 days ahead" in calendar days, not 1440 hours. The
+  resulting asymmetry — the lower bound is a moment, the upper bound is a
+  calendar edge — is deliberate: lead time protects the specialist from a
+  last-minute booking, max advance is the salon's planning horizon, and
+  those are different kinds of limits with different natural units. Only the
+  upper bound needs the salon timezone; the lower bound does not.
+- **A new pure function does the filtering, called by the orchestrator after
+  `_step_windows`.** Rejected alternative: trimming the open windows
+  themselves before stepping. Rejected because trimming would move the
+  stepping anchor, and § Stage 6.C decisions' decision 5 pins that anchor to
+  the window start — trimming a window's start to the lead-time or
+  max-advance boundary would make slot times depend on when the request
+  happened to arrive, the same grid-stability problem 6.C decision 5 already
+  rules out for a different reason.
+
+Verified before writing the above: `Salon.min_lead_time_hours` (default `3`)
+and `Salon.max_advance_days` (default `60`) match § Business rules' stated
+defaults — no mismatch found. `specialist.salon_id` is a plain column on
+`TenantScopedModel` (a standard `ForeignKey`), so it is present on any
+normally-fetched `Specialist` row with no additional query; only
+`specialist.salon` (the lazy relation, not the `_id` column) would fire one.
