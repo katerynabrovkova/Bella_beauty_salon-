@@ -69,6 +69,22 @@ class InvalidDateRangeError(DomainError):
     default_message = "The requested date range is invalid."
 
 
+class InvalidSteppingParametersError(DomainError):
+    """
+    docs/DECISIONS.md § Stage 6.E decisions: granularity_minutes/
+    occupied_minutes non-positive means a Salon/Service row is
+    misconfigured, not that the request itself was malformed — status_code
+    is 500, deliberately different from InvalidDateRangeError's 400, even
+    though both are DomainError subclasses raised from the same service
+    layer. No HTTP mapping is wired up yet; that lands with the GET
+    endpoint substage, same as InvalidDateRangeError's did.
+    """
+
+    code = "invalid_stepping_parameters"
+    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    default_message = "Slot granularity or occupied time is misconfigured."
+
+
 def _envelope(*, code: str, message: str, details: dict | None = None) -> dict:
     return {"error": {"code": code, "message": message, "details": details or {}}}
 

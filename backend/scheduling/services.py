@@ -1,7 +1,7 @@
 """
-Stage 6.C/6.D — open-window computation (docs/ARCHITECTURE.md § 6 step 1;
+Stage 6.C/6.D/6.E — availability engine (docs/ARCHITECTURE.md § 6;
 docs/DECISIONS.md § Stage 6 decisions, § Stage 6.C decisions, § Stage 6.D
-decisions).
+decisions, § Stage 6.E decisions).
 
 Functional-core / imperative-shell split: _fetch_working_hours,
 _fetch_time_off, and _fetch_appointments are the only three functions that
@@ -14,6 +14,13 @@ _subtract_intervals, which knows nothing about TimeOff/WorkingHours/
 Appointment at all — the generalised blocking-interval list a future
 closure source would plug into without this function changing (6.D's
 Appointment support is exactly that plugging-in, not a rewrite).
+
+6.E adds one more layer of each kind on top of compute_open_windows,
+without changing it: _step_windows (pure — plain numbers for
+granularity_minutes/occupied_minutes, the Window/dt.datetime vocabulary
+otherwise) and compute_candidate_start_times (the thin orchestrator, which
+calls compute_open_windows itself rather than receiving windows as an
+argument — docs/DECISIONS.md § Stage 6.E decisions).
 """
 
 import datetime as dt
@@ -24,8 +31,10 @@ from zoneinfo import ZoneInfo
 from django.db.models import QuerySet
 
 from booking.models import ACTIVE_APPOINTMENT_STATUSES, Appointment
-from core.exceptions import InvalidDateRangeError
+from catalog.models import Service
+from core.exceptions import InvalidDateRangeError, InvalidSteppingParametersError
 from specialists.models import Specialist, TimeOff, WorkingHours
+from tenants.models import Salon
 
 
 class Window(NamedTuple):
@@ -198,3 +207,83 @@ def compute_open_windows(
     ) + _appointments_to_blocking_intervals(appointment_rows)
 
     return _subtract_intervals(open_windows, blocking_intervals)
+
+
+def _step_windows(
+    windows: Sequence[Window],
+    granularity_minutes: int,
+    occupied_minutes: int,
+) -> list[dt.datetime]:
+    """
+    Steps each window into candidate start times, independently, anchored
+    to that window's own start — never to midnight or to another window's
+    grid (docs/DECISIONS.md § Stage 6.E decisions; § Stage 6.C decisions'
+    "touching intervals merge" is why this matters: two non-touching
+    windows the same day must each get their own grid). Half-open [)
+    bounds: a candidate is kept while `candidate + occupied_minutes <=
+    window.end`, so a candidate whose occupied span ends exactly at
+    window.end is offered. Strict grid only — no candidate is added beyond
+    what stepping from window.start actually lands on, even when the
+    leftover tail after the last on-grid candidate would itself fit
+    occupied_minutes.
+
+    granularity_minutes and occupied_minutes non-positive raises
+    InvalidSteppingParametersError rather than looping forever or silently
+    returning nothing — see that exception's own docstring.
+    """
+    if granularity_minutes <= 0 or occupied_minutes <= 0:
+        raise InvalidSteppingParametersError(
+            f"granularity_minutes ({granularity_minutes}) and occupied_minutes "
+            f"({occupied_minutes}) must both be positive."
+        )
+
+    step = dt.timedelta(minutes=granularity_minutes)
+    occupied = dt.timedelta(minutes=occupied_minutes)
+    candidates: list[dt.datetime] = []
+    for window in windows:
+        candidate = window.start
+        while candidate + occupied <= window.end:
+            candidates.append(candidate)
+            candidate += step
+    return candidates
+
+
+def compute_candidate_start_times(
+    specialist: Specialist,
+    service: Service,
+    salon: Salon,
+    date_from: dt.date,
+    date_to: dt.date,
+) -> list[dt.datetime]:
+    """
+    A specialist's candidate start times for a service, over
+    [date_from, date_to] (docs/ARCHITECTURE.md § 6 step 3;
+    docs/DECISIONS.md § Stage 6.E decisions). Calls compute_open_windows
+    itself rather than receiving windows as an argument, then resolves
+    occupied_minutes from service.duration_minutes + service.buffer_minutes
+    and granularity_minutes from salon.slot_granularity_minutes — two
+    different models — before calling _step_windows. `salon` is taken as an
+    explicit argument rather than derived from specialist.salon
+    specifically so this function issues no queries of its own beyond the
+    three compute_open_windows already does (docs/DECISIONS.md § Stage 6.D
+    decisions' django_assert_num_queries(3); a lazy specialist.salon access
+    would have added a fourth). Not checked against specialist.salon — see
+    docs/DECISIONS.md § Open questions.
+
+    Requires tenant context to already be bound (core.tenancy.tenant_context),
+    same as compute_open_windows — this function does not bind it itself.
+
+    Excludes lead time, the max-advance window, and conversion to
+    salon-local time entirely — those are later substages.
+    """
+    windows = compute_open_windows(
+        specialist=specialist,
+        date_from=date_from,
+        date_to=date_to,
+        salon_timezone=salon.timezone,
+    )
+    occupied_minutes = service.duration_minutes + service.buffer_minutes
+    granularity_minutes = salon.slot_granularity_minutes
+    return _step_windows(
+        windows, granularity_minutes=granularity_minutes, occupied_minutes=occupied_minutes
+    )

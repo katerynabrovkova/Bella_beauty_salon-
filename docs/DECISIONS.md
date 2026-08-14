@@ -133,6 +133,11 @@ on them, rather than being forgotten and improvised in the moment.
   objects from the same tenant-scoped request context and could not produce
   a mismatch without a bug elsewhere that unit tests on this function alone
   wouldn't be positioned to catch regardless.
+- **Local-time presentation across a DST transition** — on a spring-forward
+  day the candidate list jumps (…01:40, 02:00, 03:00, 03:20…) because 02:xx
+  does not exist locally. Whether to show that as-is, label it, or suppress
+  the affected candidates is a presentation decision belonging to the
+  local-time formatting substage, not to stepping.
 
 ## Overall style
 

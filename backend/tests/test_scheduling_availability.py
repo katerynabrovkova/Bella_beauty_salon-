@@ -27,6 +27,14 @@ scheduling/services.py is written. Two layers, matching the functional-core
   extends this same section (compute_open_windows's signature is unchanged;
   only its body gained a second blocking source, docs/DECISIONS.md § Stage
   6.D decisions), rather than adding a new file or a new entry point.
+- 6.E adds one of each layer on top: the _step_windows tests exercise the
+  new pure primitive directly, same treatment as the pure functions above;
+  the compute_candidate_start_times tests exercise the new orchestrator
+  end-to-end, layered on compute_open_windows exactly as docs/DECISIONS.md
+  § Stage 6.E decisions specifies. This file is expected to fail on
+  collection again until scheduling/services.py gains these two names and
+  core/exceptions.py gains InvalidSteppingParametersError — the same
+  ModuleNotFoundError/ImportError shape as before 6.C/6.D existed.
 """
 
 import datetime as dt
@@ -37,13 +45,15 @@ import pytest
 from accounts.models import Customer
 from booking.models import ACTIVE_APPOINTMENT_STATUSES, AppointmentStatus
 from catalog.models import Service, ServiceCategory
-from core.exceptions import InvalidDateRangeError
+from core.exceptions import InvalidDateRangeError, InvalidSteppingParametersError
 from core.tenancy import tenant_context
 from scheduling.services import (
     Window,
     _localize_window,
     _merge_intervals,
+    _step_windows,
     _subtract_intervals,
+    compute_candidate_start_times,
     compute_open_windows,
 )
 from specialists.models import Specialist
@@ -252,6 +262,152 @@ def test_localize_window_offset_recomputed_fresh_per_date_fall_back():
     before, _ = _localize_window(dt.date(2026, 10, 24), dt.time(9, 0), dt.time(18, 0), tz)
     after, _ = _localize_window(dt.date(2026, 10, 25), dt.time(9, 0), dt.time(18, 0), tz)
     assert after - before == dt.timedelta(hours=25)
+
+
+# --- _step_windows (6.E) ---------------------------------------------------
+
+
+def test_step_windows_empty_window_list_returns_empty():
+    assert _step_windows([], granularity_minutes=20, occupied_minutes=60) == []
+
+
+def test_step_windows_window_shorter_than_occupied_minutes_yields_nothing():
+    window = Window(_t(9), _t(9, 30))  # 30 minutes wide
+    assert _step_windows([window], granularity_minutes=20, occupied_minutes=60) == []
+
+
+def test_step_windows_window_exactly_equal_to_occupied_minutes_yields_one_candidate_at_start():
+    window = Window(_t(9), _t(10))  # 60 minutes wide, exactly occupied_minutes
+    assert _step_windows([window], granularity_minutes=20, occupied_minutes=60) == [_t(9)]
+
+
+def test_step_windows_candidate_ending_exactly_on_window_end_is_kept():
+    """
+    Decision 4 (half-open [) bounds): the boundary check is `candidate +
+    occupied_minutes <= window.end`, not `<`. The second candidate (09:20)
+    occupies exactly through 10:00, window.end itself, and must still be
+    offered.
+    """
+    window = Window(_t(9), _t(10))
+    result = _step_windows([window], granularity_minutes=20, occupied_minutes=40)
+    assert result == [_t(9), _t(9, 20)]
+
+
+def test_step_windows_tail_shorter_than_one_step_is_dropped_even_if_occupied_minutes_would_fit():
+    """
+    Decision 1 (strict grid only, § Stage 6.E decisions): window is 09:00-
+    09:50. After the last on-grid candidate (09:30, occupying through
+    09:40), 10 minutes remain before window end — exactly occupied_minutes
+    (10), so a slot at 09:40 would physically fit, but 09:40 is off the
+    30-minute grid anchored at 09:00 and must not be offered.
+    """
+    window = Window(_t(9), _t(9, 50))
+    result = _step_windows([window], granularity_minutes=30, occupied_minutes=10)
+    assert result == [_t(9), _t(9, 30)]
+
+
+def test_step_windows_occupied_minutes_not_a_multiple_of_granularity_steps_correctly():
+    """
+    occupied_minutes=75 mirrors the real numbers a service with
+    duration_minutes=60 and buffer_minutes=15 produces (the `service`
+    fixture below) — deliberately not a multiple of granularity_minutes=20.
+    """
+    window = Window(_t(9), _t(12))  # 180 minutes wide
+    result = _step_windows([window], granularity_minutes=20, occupied_minutes=75)
+    assert result == [_t(9) + dt.timedelta(minutes=20 * k) for k in range(6)]  # 09:00..10:40
+
+
+def test_step_windows_granularity_larger_than_whole_window_yields_only_window_start():
+    window = Window(_t(9), _t(9, 30))  # 30 minutes wide
+    result = _step_windows([window], granularity_minutes=60, occupied_minutes=10)
+    assert result == [_t(9)]
+
+
+def test_step_windows_multiple_windows_on_different_days_stepped_independently():
+    window_day1 = Window(_t(9), _t(10))
+    window_day2 = Window(_t(9) + dt.timedelta(days=1), _t(10) + dt.timedelta(days=1))
+    result = _step_windows([window_day1, window_day2], granularity_minutes=30, occupied_minutes=20)
+    assert result == [
+        _t(9),
+        _t(9, 30),
+        _t(9) + dt.timedelta(days=1),
+        _t(9, 30) + dt.timedelta(days=1),
+    ]
+
+
+def test_step_windows_one_too_short_window_contributes_nothing_but_does_not_break_the_rest():
+    too_short = Window(_t(9), _t(9, 10))  # 10 minutes wide, can't fit occupied_minutes=20
+    fits = Window(_t(11), _t(12))  # 60 minutes wide
+    result = _step_windows([too_short, fits], granularity_minutes=20, occupied_minutes=20)
+    assert result == [_t(11), _t(11, 20), _t(11, 40)]
+
+
+def test_step_windows_second_window_anchors_to_its_own_start_not_the_first_windows_grid():
+    """
+    Sharpens 'windows on different days, stepped independently' into a
+    same-day case that isolates the specific bug that case can't catch: two
+    non-touching windows the same day, 09:00-12:00 and 12:50-18:00 (a
+    50-minute gap — decision 5 of § Stage 6.C decisions is exactly why
+    these stay two windows instead of merging). At granularity 20, the
+    second window's candidates must start at 12:50, 13:10, ... — its own
+    grid, anchored to its own start. If the grid were anchored to the day
+    (midnight) or to the first window's start (09:00) instead, the next
+    09:00-anchored 20-minute line at or after 12:50 is 13:00, not 12:50,
+    and this assertion fails outright.
+    """
+    first = Window(_t(9), _t(12))
+    second = Window(_t(12, 50), _t(18))
+    result = _step_windows([first, second], granularity_minutes=20, occupied_minutes=20)
+    assert result[:9] == [_t(9) + dt.timedelta(minutes=20 * k) for k in range(9)]
+    assert result[9] == _t(12, 50)
+    assert result[9:] == [_t(12, 50) + dt.timedelta(minutes=20 * k) for k in range(15)]
+
+
+def test_step_windows_spring_forward_window_produces_23_hourly_candidates_not_24():
+    """
+    Pins UTC-only stepping arithmetic (docs/DECISIONS.md § Stage 6.E
+    decisions, "grid remainder"/DST discussion): by the time a window
+    reaches _step_windows it's already a concrete UTC interval, built via
+    _localize_window exactly as the spring-forward tests above prove (23
+    real UTC hours on 2026-03-29, Europe/Kyiv). Stepping that window in
+    constant 60-minute UTC steps must therefore produce 23 candidates, one
+    per real UTC hour — never the naive 24 a local-wall-clock-minutes
+    implementation would produce.
+    """
+    tz = ZoneInfo("Europe/Kyiv")
+    midnight, _ = _localize_window(dt.date(2026, 3, 29), dt.time(0, 0), dt.time(0, 0), tz)
+    next_midnight, _ = _localize_window(dt.date(2026, 3, 30), dt.time(0, 0), dt.time(0, 0), tz)
+    window = Window(midnight, next_midnight)
+    result = _step_windows([window], granularity_minutes=60, occupied_minutes=60)
+    assert result == [midnight + dt.timedelta(hours=k) for k in range(23)]
+
+
+def test_step_windows_fall_back_window_produces_25_hourly_candidates_not_24():
+    """Fall-back counterpart — 25 real UTC hours on 2026-10-25, Europe/Kyiv."""
+    tz = ZoneInfo("Europe/Kyiv")
+    midnight, _ = _localize_window(dt.date(2026, 10, 25), dt.time(0, 0), dt.time(0, 0), tz)
+    next_midnight, _ = _localize_window(dt.date(2026, 10, 26), dt.time(0, 0), dt.time(0, 0), tz)
+    window = Window(midnight, next_midnight)
+    result = _step_windows([window], granularity_minutes=60, occupied_minutes=60)
+    assert result == [midnight + dt.timedelta(hours=k) for k in range(25)]
+
+
+@pytest.mark.parametrize("granularity_minutes", [0, -5])
+def test_step_windows_non_positive_granularity_raises(granularity_minutes):
+    with pytest.raises(InvalidSteppingParametersError):
+        _step_windows([WINDOW], granularity_minutes=granularity_minutes, occupied_minutes=30)
+
+
+@pytest.mark.parametrize("occupied_minutes", [0, -5])
+def test_step_windows_non_positive_occupied_minutes_raises(occupied_minutes):
+    with pytest.raises(InvalidSteppingParametersError):
+        _step_windows([WINDOW], granularity_minutes=20, occupied_minutes=occupied_minutes)
+
+
+def test_step_windows_both_non_positive_at_once_still_raises_a_single_error():
+    """Neither check may assume the other field is well-formed first."""
+    with pytest.raises(InvalidSteppingParametersError):
+        _step_windows([WINDOW], granularity_minutes=0, occupied_minutes=-5)
 
 
 # --- compute_open_windows (integration, DB-backed) ------------------------
@@ -1160,3 +1316,278 @@ def test_compute_open_windows_issues_exactly_three_queries(
                 date_to=monday,
                 salon_timezone=salon.timezone,
             )
+
+
+# --- compute_candidate_start_times (6.E) -----------------------------------
+
+
+def test_compute_candidate_start_times_resolves_occupied_from_service_and_granularity_from_salon(
+    salon, specialist, service
+):
+    """
+    salon.slot_granularity_minutes defaults to 15, the same number as
+    service.buffer_minutes (conftest.py's `service` fixture: duration=60,
+    buffer=15) — a granularity misread from service.buffer_minutes instead
+    of salon.slot_granularity_minutes would produce an identical candidate
+    list at the default and pass regardless. Overriding
+    salon.slot_granularity_minutes to 20 here makes all three inputs
+    (granularity=20, duration=60, buffer=15, occupied_minutes=75) mutually
+    distinct, so this test discriminates the specific misreads it exists to
+    catch: with the 06:00-08:00 UTC window below,
+      - correct (granularity from salon=20, occupied from service=75):
+        06:00, 06:20, 06:40 — 3 candidates.
+      - granularity misread from service.buffer_minutes (15) instead of
+        salon.slot_granularity_minutes (20): would give 4 candidates.
+      - granularity misread from service.duration_minutes (60): would give
+        1 candidate.
+      - occupied_minutes misread as salon.slot_granularity_minutes alone
+        (20) instead of service.duration_minutes + buffer_minutes (75):
+        would give 6 candidates.
+    """
+    salon.slot_granularity_minutes = 20
+    salon.save(update_fields=["slot_granularity_minutes"])
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(11, 0),  # 120 minutes local; Aug in Europe/Kyiv is UTC+3
+    )
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+        )
+    start = dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC)
+    assert result == [start + dt.timedelta(minutes=20 * k) for k in range(3)]  # 06:00, 06:20, 06:40
+
+
+def test_compute_candidate_start_times_actually_calls_compute_open_windows(
+    salon, specialist, service
+):
+    """
+    Proves real delegation, not a reimplementation that only reads
+    WorkingHours: a TimeOff carved out of the middle of the shift must
+    change the candidate list from what raw WorkingHours alone would
+    produce. Without the TimeOff, 06:00-10:00 UTC (240 minutes) would give
+    12 candidates at granularity 15; with it splitting the window into a
+    60-minute piece (too short for occupied_minutes=75) and a 150-minute
+    piece, only 6 survive.
+    """
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(13, 0),  # 240 minutes local -> 06:00-10:00 UTC
+    )
+    make_time_off(
+        salon=salon,
+        specialist=specialist,
+        start_datetime=dt.datetime(2026, 8, 17, 7, 0, tzinfo=UTC),
+        end_datetime=dt.datetime(2026, 8, 17, 7, 30, tzinfo=UTC),
+    )
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+        )
+    start = dt.datetime(2026, 8, 17, 7, 30, tzinfo=UTC)
+    assert result == [start + dt.timedelta(minutes=15 * k) for k in range(6)]  # 07:30..08:45
+
+
+def test_compute_candidate_start_times_issues_exactly_three_queries(
+    django_assert_num_queries, salon, customer, specialist, service
+):
+    """
+    Mirrors test_compute_open_windows_issues_exactly_three_queries (§ Stage
+    6.D decisions). Proves the explicit `salon` argument (§ Stage 6.E
+    decisions) didn't add a fourth query the way a lazy specialist.salon
+    access would have — compute_candidate_start_times itself issues no
+    queries of its own beyond the three compute_open_windows already does.
+    """
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    make_time_off(
+        salon=salon,
+        specialist=specialist,
+        start_datetime=dt.datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        end_datetime=dt.datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+    )
+    make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=dt.datetime(2026, 8, 17, 11, 0, tzinfo=UTC),
+    )
+    with tenant_context(salon.id):
+        with django_assert_num_queries(3):
+            compute_candidate_start_times(
+                specialist=specialist,
+                service=service,
+                salon=salon,
+                date_from=monday,
+                date_to=monday,
+            )
+
+
+def test_compute_candidate_start_times_specialist_with_no_working_hours_returns_empty(
+    salon, specialist, service
+):
+    monday = dt.date(2026, 8, 17)
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+        )
+    assert result == []
+
+
+def test_compute_candidate_start_times_non_positive_salon_granularity_raises(
+    salon, specialist, service
+):
+    salon.slot_granularity_minutes = 0
+    salon.save(update_fields=["slot_granularity_minutes"])
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    with tenant_context(salon.id), pytest.raises(InvalidSteppingParametersError):
+        compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+        )
+
+
+def test_compute_candidate_start_times_date_from_after_date_to_raises_invalid_date_range(
+    salon, specialist, service
+):
+    """Proves compute_open_windows's own validation isn't bypassed or
+    swallowed by the new orchestrator layer."""
+    with tenant_context(salon.id), pytest.raises(InvalidDateRangeError):
+        compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=dt.date(2026, 8, 20),
+            date_to=dt.date(2026, 8, 15),
+        )
+
+
+def test_compute_candidate_start_times_inactive_specialist_returns_empty(
+    salon, specialist, service
+):
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    with tenant_context(salon.id):
+        specialist.is_active = False
+        specialist.save(update_fields=["is_active"])
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+        )
+    assert result == []
+
+
+def test_compute_candidate_start_times_occupied_minutes_larger_than_every_window_returns_empty(
+    salon, specialist, service
+):
+    """
+    Integration-level counterpart of the pure _step_windows case, confirming
+    docs/ARCHITECTURE.md § 6's existing edge case ("a service duration
+    longer than any single open window never produces a slot — correct
+    behavior, not a bug") holds through the whole orchestrator, not only the
+    primitive: no exception, just an empty list.
+    """
+    monday = dt.date(2026, 8, 17)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(9, 30),  # 30 minutes local, shorter than occupied_minutes=75
+    )
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+        )
+    assert result == []
+
+
+def test_compute_candidate_start_times_full_ordering_across_multiple_days(
+    salon, specialist, service
+):
+    """
+    Explicit ordering contract, not an incidental one. Nothing pins today
+    that the returned list is sorted ascending — it happens to be, because
+    _merge_intervals sorts three layers down inside compute_open_windows,
+    but that's an implementation detail of window-building, not a
+    documented contract of compute_candidate_start_times. Monday and
+    Wednesday each get an identical shift (Tuesday has none), and this
+    asserts the full, exact, day-spanning candidate list in ascending
+    chronological order — a future change to how blocking intervals or
+    windows get composed that scrambled cross-window order would fail this
+    test even if every individual window's own candidates stayed correct.
+    """
+    monday = dt.date(2026, 8, 17)
+    wednesday = monday + dt.timedelta(days=2)
+    for day in (monday, wednesday):
+        make_working_hours(
+            salon=salon,
+            specialist=specialist,
+            day_of_week=day.weekday(),
+            start_time=dt.time(9, 0),
+            end_time=dt.time(12, 0),  # 180 minutes local -> 06:00-09:00 UTC
+        )
+    with tenant_context(salon.id):
+        result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=wednesday,
+        )
+    monday_start = dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC)
+    wednesday_start = dt.datetime(2026, 8, 19, 6, 0, tzinfo=UTC)
+    expected = [monday_start + dt.timedelta(minutes=15 * k) for k in range(8)] + [
+        wednesday_start + dt.timedelta(minutes=15 * k) for k in range(8)
+    ]
+    assert result == expected
