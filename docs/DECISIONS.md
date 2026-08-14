@@ -1341,6 +1341,54 @@ are recorded here as agreed, not resolved against a prior written proposal.
   max-advance boundary would make slot times depend on when the request
   happened to arrive, the same grid-stability problem 6.C decision 5 already
   rules out for a different reason.
+- **The max-advance boundary computation gets its own pure function,
+  `_max_advance_boundary(now: dt.datetime, max_advance_days: int, tz:
+  ZoneInfo) -> dt.datetime`, with an inlined two-line body — not a call to
+  `_localize_window(...).start`.** `_localize_window` does not validate
+  `start_time` against `end_time`, and `start_time == end_time` is already
+  the established idiom in this module for extracting a single instant —
+  `compute_open_windows` uses it twice today, for `range_start_utc` and
+  `range_end_utc` — so reusing it here would have worked. It is rejected on
+  concept, not on breakage: the arithmetic is identical, but
+  `_localize_window` builds a working-hours `Window`, and this is a single
+  cutoff instant, not a window that happens to have zero width. Routing
+  through it would mean constructing a `Window` only to discard half of it,
+  leaving a reader wondering why a booking-window boundary is built out of a
+  working-hours type. Giving the boundary computation its own name and body
+  also makes it directly unit-testable in isolation — including the § Open
+  questions entry on midnight-transition zones, with a synthetic
+  `ZoneInfo("America/Santiago")` on its transition day — with no ORM, no
+  `tenant_context`, and no fixtures.
+- **`now` must be timezone-aware; `compute_candidate_start_times` checks this
+  on its very first line, before anything else runs, and raises a plain
+  `ValueError` if it isn't** — via `django.utils.timezone.is_naive(now)`,
+  not a hand-rolled `now.tzinfo is None`, because `is_naive` correctly
+  handles a `tzinfo` object that is set but returns `None` from
+  `utcoffset()`, which the hand-rolled check would miss. Placed first for
+  the same reason `date_from > date_to` is the first thing
+  `compute_open_windows` checks, and the same reason § Stage 6.C decisions
+  resolves `ZoneInfo` at the top rather than several calls deep: a naive
+  `now` should always fail the same way, in the same place, not sometimes
+  loudly and sometimes silently depending on what else happens to run
+  first. Without this guard, a naive `now` survives `now + timedelta`
+  unchanged, then `.astimezone(tz)` silently presumes the host's local zone
+  instead of raising, and `_filter_candidates_by_booking_window`'s
+  comparison only raises `TypeError` once `candidates` is non-empty — with
+  an empty candidate list the whole call would instead return `[]`,
+  indistinguishable from "genuinely nothing available." Raises a plain
+  `ValueError`, not a new `DomainError` subclass: every existing
+  `DomainError` subclass exists so `core.exceptions.exception_handler` can
+  turn it into a structured client-facing response, for errors a request or
+  a misconfigured database row can trigger. A naive `now` can be neither —
+  per the first decision above, `timezone.now()` is called exactly once, in
+  the view, and is always aware — so the only way a naive value reaches
+  this function is a caller's code being wrong (a test, or a future
+  non-view caller such as a Celery task or the AI assistant's tool
+  function), with no API boundary to cross. This follows the same
+  precedent already set in this module: `compute_open_windows` lets
+  `zoneinfo.ZoneInfoNotFoundError` propagate raw, unwrapped, for the same
+  reason (§ Open questions, "`Salon.timezone` write-time validation") — a
+  problem with the caller or the configuration, not with client input.
 
 Verified before writing the above: `Salon.min_lead_time_hours` (default `3`)
 and `Salon.max_advance_days` (default `60`) match § Business rules' stated
