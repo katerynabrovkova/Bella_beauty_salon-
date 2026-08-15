@@ -283,6 +283,16 @@ handles the case where no specialist is specified — it enumerates the service'
 `SpecialistService`-qualified, active specialists and unions each one's
 per-specialist availability (`docs/DECISIONS.md` § Stage 6 decisions).
 
+There are two booking entry paths into this engine, differing only in the
+wrapper above it: an **"any specialist"** path, which reads through the
+composition function above (a time is available if at least one qualifying
+specialist is free then), and a **"specific specialist"** path, which calls
+the per-specialist algorithm directly with no composition. In the
+"any specialist" path, which specialists are actually free at each time is
+computed as part of the union but served separately, from a second lookup
+once a client has chosen a time, not inline with the first response
+(`docs/DECISIONS.md` § Stage 6 and § Stage 6.G decisions).
+
 **Where it lives:** `scheduling`, as a stateless service function, not a persisted
 "slots" table. This is a deliberate correctness-over-performance call: a materialized
 slot table needs invalidation on every write to `WorkingHours`, `TimeOff`, and

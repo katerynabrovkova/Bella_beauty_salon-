@@ -162,6 +162,26 @@ on them, rather than being forgotten and improvised in the moment.
   question from "Local-time presentation across a DST transition" directly
   above, which is about what to *display*; this one is about where the
   boundary silently *moves to*. Do not merge them.
+- **Per-specialist service duration and the "any specialist" union rule.**
+  Today `occupied_minutes` (`service.duration_minutes +
+  service.buffer_minutes`) is identical for every specialist in the union —
+  `Service.duration_minutes`/`buffer_minutes` are single fields on
+  `catalog.Service`, and `SpecialistService` (the through-model) carries no
+  per-specialist override of either — so "free" is unambiguous: the same
+  occupied span is checked against every qualifying specialist's calendar.
+  If per-specialist duration overrides are ever introduced, the union rule
+  (§ Stage 6 decisions, "Multi-specialist availability") needs revisiting —
+  "at least one specialist free" would then mean free for *that
+  specialist's own* duration, not a shared one, which changes what a bare
+  time in the response actually promises.
+- **The response-shape reversal (§ Stage 6 decisions, "Reversed
+  2026-08-15") leans on specialists having a photo and a description shown
+  together on their own screen.** The description alone justifies moving
+  the specialist list to a second step; photos are not decided at all —
+  storage/CDN choice, upload flow, and whether the public frontend needs
+  them are still open (§ Open questions, "Specialist photos," above).
+  Cross-linked here so the second-step specialist-picker screen isn't
+  designed assuming photos exist before that question resolves.
 
 ## Overall style
 
@@ -981,16 +1001,28 @@ decisions, not as notes written after the fact.
   because it turns "show me any available time for this service" into N HTTP
   requests per page view (one per qualified specialist), which doesn't scale
   with the number of specialists a salon employs and pushes a backend
-  concern onto every client.
-- **Response shape for the multi-specialist mode: each slot carries the list
-  of specialists available at that time, not a bare time.** Reasoning: in
-  the beauty-salon domain a specialist is not an interchangeable resource —
-  which specific person a customer gets matters to them — and the
-  composition function already has every qualified specialist's name in hand
-  while computing the union, so attaching it costs nothing extra. Collapsing
-  a list down to a bare time later, if some future caller only ever wants
-  "is anything free at 14:00," is trivial; reconstructing "who" after the
-  response has already thrown that information away is not.
+  concern onto every client. Named explicitly, these are the two booking
+  entry paths: **"any specialist"** goes through the composition wrapper —
+  a time is available if at least one qualifying specialist is free then;
+  **"specific specialist"** calls `compute_candidate_start_times` directly,
+  no composition. Both read through the same single-specialist engine and
+  differ only in the wrapper above it.
+- **Reversed 2026-08-15 — response shape for the multi-specialist mode: a
+  slot in the availability response is a bare time, not a list of
+  specialists.** This reverses the decision originally recorded here on
+  2026-08-13: "each slot carries the list of specialists available at that
+  time, not a bare time," reasoned on the grounds that "a specialist is not
+  an interchangeable resource... the composition function already has every
+  qualified specialist's name in hand while computing the union, so
+  attaching it costs nothing extra." That reasoning about the *data* being
+  cheap to attach was correct and still holds — the reversal is about
+  *presentation*, not cost: each specialist is shown with a photo and a
+  description, which does not fit stacked under every time row and needs
+  its own screen. The specialist-availability mapping the composition
+  function computes while unioning is therefore still computed, exactly as
+  before — it is simply not serialized into this response. It is what the
+  second endpoint (§ Stage 6.G decisions) serves once the client has picked
+  a time; nothing here is discarded, only deferred to the next request.
 - **Stage 6 scope includes a read-only `GET` endpoint, not only the internal
   `scheduling` service function.** Reasoning: where tenant context gets
   bound for `TenantScopedManager` (`core.tenancy.tenant_context`, per
@@ -1396,3 +1428,44 @@ defaults — no mismatch found. `specialist.salon_id` is a plain column on
 `TenantScopedModel` (a standard `ForeignKey`), so it is present on any
 normally-fetched `Specialist` row with no additional query; only
 `specialist.salon` (the lazy relation, not the `_id` column) would fire one.
+
+### Stage 6.G decisions (multi-specialist response-shape reversal — second-lookup endpoint)
+
+Decided 2026-08-15, before implementation. No separate 6.G design proposal
+preceded this section — these decisions came directly out of discussion and
+are recorded here as agreed, not resolved against a prior written proposal.
+Companion to the response-shape reversal recorded in § Stage 6 decisions
+above ("Reversed 2026-08-15").
+
+- **The second endpoint (specialist lookup for a chosen time) takes a raw
+  time plus `service` and the same date range already used for the
+  time-grid call as parameters — no token, no server-side stored
+  computation.** Consistent with this project's existing minimal-state
+  preference. It always **re-computes** which qualifying specialists are
+  free at that time; it never reuses a cached result from the first
+  (time-grid) response — the specialist-availability mapping computed while
+  building the time grid is not persisted or handed back as an opaque
+  reference to be redeemed later. A **re-computed empty result is a valid
+  answer, not an error**: between the two requests another booking may have
+  taken the only qualifying specialist at that moment (the ordinary booking
+  race already described in `docs/ARCHITECTURE.md` § 6's edge cases and
+  guarded for real at booking time per § 7), so the endpoint returns an
+  empty list as such, never mapped to a 4xx/5xx — the client's job is to
+  tell the customer the time is no longer available and let them pick
+  another, the same way it would treat an empty time grid.
+- **The "specific specialist" pick list is filtered by `is_active` before
+  any slot computation runs — an inactive specialist is never offered as
+  pickable at all.** Distinct from the existing `is_active` guard inside
+  `compute_open_windows` (§ Stage 6.C decisions, "`is_active=False`
+  specialist exclusion is guarded in two places"): that guard concerns a
+  specialist's own schedule, so a stray direct call for an inactive
+  specialist still resolves to an empty result rather than stale data or a
+  crash. This decision concerns an earlier step — which specialists a
+  customer is offered to choose from in the first place, before "specific
+  specialist" ever makes that direct call. The same `is_active` filter the
+  composition function already applies when enumerating candidates for the
+  "any specialist" path (§ Stage 6 decisions, "Multi-specialist
+  availability") applies to this pick list too, so both entry paths present
+  only currently-employed specialists to the customer, for the same reason:
+  nobody should be offered to book someone who no longer works at the salon
+  (§ Stage 5 decisions).
