@@ -1,19 +1,21 @@
 """
-Stage 6.C/6.D/6.E — availability engine (docs/ARCHITECTURE.md § 6;
+Stage 6.C/6.D/6.E/6.F/6.H — availability engine (docs/ARCHITECTURE.md § 6;
 docs/DECISIONS.md § Stage 6 decisions, § Stage 6.C decisions, § Stage 6.D
-decisions, § Stage 6.E decisions).
+decisions, § Stage 6.E decisions, § Stage 6.F decisions, § Stage 6.H
+decisions).
 
 Functional-core / imperative-shell split: _fetch_working_hours,
-_fetch_time_off, and _fetch_appointments are the only three functions that
-touch the tenant-scoped ORM (and so are the only three that require tenant
-context to already be bound, via core.tenancy.tenant_context — they don't
-bind it themselves, same convention as every other service-layer function
-in this project, e.g. specialists/services.py's _future_appointments).
-Everything else here is a pure function over plain values, in particular
-_subtract_intervals, which knows nothing about TimeOff/WorkingHours/
-Appointment at all — the generalised blocking-interval list a future
-closure source would plug into without this function changing (6.D's
-Appointment support is exactly that plugging-in, not a rewrite).
+_fetch_time_off, _fetch_appointments, and _fetch_qualifying_specialists
+(6.H) are the only four functions that touch the tenant-scoped ORM (and so
+are the only four that require tenant context to already be bound, via
+core.tenancy.tenant_context — they don't bind it themselves, same
+convention as every other service-layer function in this project, e.g.
+specialists/services.py's _future_appointments). Everything else here is a
+pure function over plain values, in particular _subtract_intervals, which
+knows nothing about TimeOff/WorkingHours/Appointment at all — the
+generalised blocking-interval list a future closure source would plug into
+without this function changing (6.D's Appointment support is exactly that
+plugging-in, not a rewrite).
 
 6.E adds one more layer of each kind on top of compute_open_windows,
 without changing it: _step_windows (pure — plain numbers for
@@ -30,6 +32,20 @@ taking an already-resolved ZoneInfo rather than resolving one itself).
 compute_candidate_start_times gains a required `now: dt.datetime` parameter
 with no default, validated on its first line (docs/DECISIONS.md § Stage 6.F
 decisions).
+
+6.H adds the "any specialist" composition on top of
+compute_candidate_start_times, without changing it:
+_fetch_qualifying_specialists (the fourth ORM-touching function, above),
+_merge_specialist_availability (pure — combines each specialist's own
+candidate times into {start_time: [specialists free then]}, sorting keys
+explicitly), and compute_multi_specialist_availability (the thin
+orchestrator, which calls compute_candidate_start_times once per qualifying
+specialist rather than receiving their results — the same shape already
+established for compute_candidate_start_times itself calling
+compute_open_windows). Re-validates `now` on its own first line rather than
+relying on compute_candidate_start_times's inner guard, because zero
+qualifying specialists would otherwise skip that inner call entirely
+(docs/DECISIONS.md § Stage 6.H decisions).
 """
 
 import datetime as dt
@@ -346,3 +362,78 @@ def compute_candidate_start_times(
     tz = ZoneInfo(salon.timezone)
     upper_bound = _max_advance_boundary(now, salon.max_advance_days, tz)
     return _filter_candidates_by_booking_window(candidates, lower_bound, upper_bound)
+
+
+def _fetch_qualifying_specialists(service: Service) -> QuerySet[Specialist]:
+    """
+    Specialists linked to `service` via SpecialistService and currently
+    active. No `.distinct()`: SpecialistService's
+    UniqueConstraint(specialist, service) already rules out more than one
+    join row per specialist for a single service, so this filter can't
+    produce duplicate Specialist rows to begin with (docs/DECISIONS.md §
+    Stage 6.H decisions).
+    """
+    return Specialist.objects.filter(services=service, is_active=True)
+
+
+def _merge_specialist_availability(
+    per_specialist: Sequence[tuple[Specialist, Sequence[dt.datetime]]],
+) -> dict[dt.datetime, list[Specialist]]:
+    """
+    Pure — combines each specialist's own candidate times into
+    {start_time: [specialists free then]}. Keys are sorted explicitly via
+    dict(sorted(...)): plain dicts preserve insertion order but do not sort
+    themselves (docs/DECISIONS.md § Stage 6.H decisions).
+    """
+    mapping: dict[dt.datetime, list[Specialist]] = {}
+    for specialist, times in per_specialist:
+        for start in times:
+            mapping.setdefault(start, []).append(specialist)
+    return dict(sorted(mapping.items()))
+
+
+def compute_multi_specialist_availability(
+    service: Service,
+    salon: Salon,
+    date_from: dt.date,
+    date_to: dt.date,
+    now: dt.datetime,
+) -> dict[dt.datetime, list[Specialist]]:
+    """
+    The "any specialist" composition (docs/ARCHITECTURE.md § 6; § Stage 6
+    decisions): calls compute_candidate_start_times once per specialist
+    qualified for `service` (linked via SpecialistService, is_active) and
+    unions the results into {start_time: [specialists free then]}. Consumed
+    by both the time-grid and the chosen-time lookup endpoints — recomputed
+    on every call, never persisted between them (docs/DECISIONS.md § Stage
+    6.G decisions, § Stage 6.H decisions).
+
+    `now` is validated here, on the first line, rather than relying on the
+    inner compute_candidate_start_times guard: with zero qualifying
+    specialists the inner function is never called at all, so a naive `now`
+    would otherwise silently produce {} instead of raising
+    (docs/DECISIONS.md § Stage 6.H decisions).
+
+    Requires tenant context to already be bound (core.tenancy.tenant_context),
+    same as compute_open_windows and compute_candidate_start_times — this
+    function does not bind it itself.
+    """
+    if timezone.is_naive(now):
+        raise ValueError("now must be a timezone-aware datetime.")
+
+    qualifying_specialists = list(_fetch_qualifying_specialists(service))
+    per_specialist = [
+        (
+            specialist,
+            compute_candidate_start_times(
+                specialist=specialist,
+                service=service,
+                salon=salon,
+                date_from=date_from,
+                date_to=date_to,
+                now=now,
+            ),
+        )
+        for specialist in qualifying_specialists
+    ]
+    return _merge_specialist_availability(per_specialist)

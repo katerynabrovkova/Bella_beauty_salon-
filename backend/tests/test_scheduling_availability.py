@@ -64,12 +64,14 @@ from scheduling.services import (
     _localize_window,
     _max_advance_boundary,
     _merge_intervals,
+    _merge_specialist_availability,
     _step_windows,
     _subtract_intervals,
     compute_candidate_start_times,
+    compute_multi_specialist_availability,
     compute_open_windows,
 )
-from specialists.models import Specialist
+from specialists.models import Specialist, SpecialistService
 from tests.conftest import make_appointment, make_time_off, make_working_hours
 
 UTC = dt.UTC
@@ -89,6 +91,21 @@ def _localized_midnight(salon, date: dt.date) -> dt.datetime:
     return dt.datetime(date.year, date.month, date.day, tzinfo=ZoneInfo(salon.timezone)).astimezone(
         UTC
     )
+
+
+def _make_specialist(*, salon, name: str, is_active: bool = True) -> Specialist:
+    """
+    Local helper, used only by the compute_multi_specialist_availability
+    tests (6.H) — not promoted to conftest.py's `specialist` fixture, which
+    is a single fixed specialist ("Jane"), not a factory for several.
+    """
+    with tenant_context(salon.id):
+        return Specialist.objects.create(salon=salon, name=name, is_active=is_active)
+
+
+def _link_specialist_service(*, salon, specialist: Specialist, service: Service) -> None:
+    with tenant_context(salon.id):
+        SpecialistService.objects.create(salon=salon, specialist=specialist, service=service)
 
 
 WINDOW = Window(_t(9), _t(18))
@@ -512,6 +529,37 @@ def test_max_advance_boundary_pins_current_behavior_on_nonexistent_local_midnigh
     now = dt.datetime(2026, 9, 5, 12, 0, tzinfo=UTC)  # local Santiago Sep 5, pre-transition
     boundary = _max_advance_boundary(now, max_advance_days=0, tz=tz)
     assert boundary == dt.datetime(2026, 9, 6, 4, 0, tzinfo=UTC)
+
+
+# --- _merge_specialist_availability (6.H) ------------------------------------
+
+
+def test_merge_specialist_availability_empty_input_returns_empty():
+    assert _merge_specialist_availability([]) == {}
+
+
+def test_merge_specialist_availability_sorts_keys_and_unions_overlap():
+    """
+    Mixed input: A and B each contribute a distinct time, plus one time
+    (_t(10)) both are free at. Per-specialist lists are passed in
+    deliberately unsorted (_t(11) before _t(9) for A) to prove the ascending
+    order comes from the function sorting, not from input order or
+    insertion-order luck — plain dicts preserve insertion order but do not
+    sort themselves (docs/DECISIONS.md § Stage 6.H decisions).
+    """
+    a = Specialist(name="A")
+    b = Specialist(name="B")
+    pairs = [
+        (a, [_t(11), _t(9), _t(10)]),
+        (b, [_t(10)]),
+    ]
+    result = _merge_specialist_availability(pairs)
+    assert list(result.keys()) == [_t(9), _t(10), _t(11)]
+    assert result == {
+        _t(9): [a],
+        _t(10): [a, b],
+        _t(11): [a],
+    }
 
 
 # --- compute_open_windows (integration, DB-backed) ------------------------
@@ -1981,3 +2029,237 @@ def test_compute_candidate_start_times_naive_now_raises_value_error(salon, speci
             date_to=monday,
             now=dt.datetime(2026, 8, 17, 6, 0),  # naive — no tzinfo
         )
+
+
+# --- compute_multi_specialist_availability (6.H) -----------------------------
+
+
+def test_compute_multi_specialist_availability_overlapping_time_maps_to_both(salon, service):
+    """
+    Two qualifying specialists share identical WorkingHours, so every
+    candidate time is one both are free at. Proves the union actually
+    unions — a single time key with both specialists in its value, not two
+    entries for the same instant and not first-writer-wins silently
+    dropping the second specialist (§ Stage 6.H decisions).
+    """
+    monday = dt.date(2026, 8, 17)
+    ann = _make_specialist(salon=salon, name="Ann")
+    bob = _make_specialist(salon=salon, name="Bob")
+    for person in (ann, bob):
+        _link_specialist_service(salon=salon, specialist=person, service=service)
+        make_working_hours(
+            salon=salon,
+            specialist=person,
+            day_of_week=monday.weekday(),
+            start_time=dt.time(9, 0),
+            end_time=dt.time(11, 0),
+        )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    with tenant_context(salon.id):
+        result = compute_multi_specialist_availability(
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    assert result == {
+        _t(6): [ann, bob],
+        _t(6, 15): [ann, bob],
+        _t(6, 30): [ann, bob],
+        _t(6, 45): [ann, bob],
+    }
+
+
+def test_compute_multi_specialist_availability_disjoint_times_no_shared_key(salon, service):
+    """Ann and Bob work non-overlapping windows — no time key ever maps to
+    both, each key maps to exactly the one specialist who is actually free
+    then."""
+    monday = dt.date(2026, 8, 17)
+    ann = _make_specialist(salon=salon, name="Ann")
+    bob = _make_specialist(salon=salon, name="Bob")
+    _link_specialist_service(salon=salon, specialist=ann, service=service)
+    _link_specialist_service(salon=salon, specialist=bob, service=service)
+    make_working_hours(
+        salon=salon,
+        specialist=ann,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(11, 0),
+    )
+    make_working_hours(
+        salon=salon,
+        specialist=bob,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(14, 0),
+        end_time=dt.time(16, 0),
+    )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    with tenant_context(salon.id):
+        result = compute_multi_specialist_availability(
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    assert result == {
+        _t(6): [ann],
+        _t(6, 15): [ann],
+        _t(6, 30): [ann],
+        _t(6, 45): [ann],
+        _t(11): [bob],
+        _t(11, 15): [bob],
+        _t(11, 30): [bob],
+        _t(11, 45): [bob],
+    }
+
+
+def test_compute_multi_specialist_availability_excludes_inactive_specialist(
+    django_assert_num_queries, salon, service
+):
+    """
+    Ann and Bob are otherwise identical (same WorkingHours); Bob is
+    is_active=False. Bob must be absent from the mapping AND
+    compute_candidate_start_times must never be called for him — pinned by
+    the query count, so the exclusion can only pass if it happens at
+    _fetch_qualifying_specialists (§ Stage 6.H decisions), not as a
+    downstream filter that would still spend Bob's three queries. If Bob's
+    queries ran, this would be 1 + 3*2 = 7, not 1 + 3*1 = 4 — the same class
+    of accidental-pass risk the earlier is_active audit found for the
+    single-specialist path.
+    """
+    monday = dt.date(2026, 8, 17)
+    ann = _make_specialist(salon=salon, name="Ann")
+    bob = _make_specialist(salon=salon, name="Bob", is_active=False)
+    for person in (ann, bob):
+        _link_specialist_service(salon=salon, specialist=person, service=service)
+        make_working_hours(
+            salon=salon,
+            specialist=person,
+            day_of_week=monday.weekday(),
+            start_time=dt.time(9, 0),
+            end_time=dt.time(11, 0),
+        )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    with tenant_context(salon.id):
+        with django_assert_num_queries(1 + 3 * 1):
+            result = compute_multi_specialist_availability(
+                service=service,
+                salon=salon,
+                date_from=monday,
+                date_to=monday,
+                now=now,
+            )
+    assert result == {
+        _t(6): [ann],
+        _t(6, 15): [ann],
+        _t(6, 30): [ann],
+        _t(6, 45): [ann],
+    }
+
+
+def test_compute_multi_specialist_availability_zero_qualifying_specialists_returns_empty(
+    salon, service
+):
+    """No specialist is linked to the service at all — a valid answer, {},
+    not an error, not an exception (§ Stage 6.H decisions)."""
+    monday = dt.date(2026, 8, 17)
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    with tenant_context(salon.id):
+        result = compute_multi_specialist_availability(
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    assert result == {}
+
+
+def test_compute_multi_specialist_availability_naive_now_raises_with_zero_qualifying_specialists(
+    salon, service
+):
+    """
+    § Stage 6.H decisions: with zero qualifying specialists the inner
+    compute_candidate_start_times is never called, so this function must
+    re-validate `now` itself on its first line — otherwise a naive `now`
+    would silently return {}, indistinguishable from "genuinely nothing
+    available." No specialist is linked to the service, so if the guard
+    lived only in the inner function this would wrongly return {} instead
+    of raising.
+    """
+    monday = dt.date(2026, 8, 17)
+    with tenant_context(salon.id), pytest.raises(ValueError):
+        compute_multi_specialist_availability(
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=dt.datetime(2026, 8, 17, 0, 0),  # naive — no tzinfo
+        )
+
+
+def test_compute_multi_specialist_availability_single_specialist_mirrors_primitive(
+    salon, specialist, service
+):
+    """
+    One qualifying specialist: the mapping's keys must be exactly that
+    specialist's own compute_candidate_start_times list, each mapped to
+    [that specialist] — the composition changes nothing about a single
+    specialist's own result.
+    """
+    monday = dt.date(2026, 8, 17)
+    _link_specialist_service(salon=salon, specialist=specialist, service=service)
+    make_working_hours(
+        salon=salon,
+        specialist=specialist,
+        day_of_week=monday.weekday(),
+        start_time=dt.time(9, 0),
+        end_time=dt.time(18, 0),
+    )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    with tenant_context(salon.id):
+        expected_times = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+        result = compute_multi_specialist_availability(
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    assert expected_times != []  # baseline: this fixture must actually produce candidates
+    assert result == {t: [specialist] for t in expected_times}
+
+
+@pytest.mark.parametrize("n_qualifying", [0, 1, 3])
+def test_compute_multi_specialist_availability_query_count_is_formula_of_n(
+    django_assert_num_queries, salon, service, n_qualifying
+):
+    """
+    § Stage 6.H decisions / § Open questions: 1 + 3*N, N counting only
+    qualifying (linked + is_active) specialists. No WorkingHours needed —
+    compute_open_windows issues its three queries regardless of whether any
+    WorkingHours rows exist for a given specialist.
+    """
+    monday = dt.date(2026, 8, 17)
+    for i in range(n_qualifying):
+        person = _make_specialist(salon=salon, name=f"Specialist{i}")
+        _link_specialist_service(salon=salon, specialist=person, service=service)
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    with tenant_context(salon.id):
+        with django_assert_num_queries(1 + 3 * n_qualifying):
+            compute_multi_specialist_availability(
+                service=service,
+                salon=salon,
+                date_from=monday,
+                date_to=monday,
+                now=now,
+            )
