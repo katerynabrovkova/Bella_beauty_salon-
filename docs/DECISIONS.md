@@ -182,6 +182,15 @@ on them, rather than being forgotten and improvised in the moment.
   them are still open (§ Open questions, "Specialist photos," above).
   Cross-linked here so the second-step specialist-picker screen isn't
   designed assuming photos exist before that question resolves.
+- **`compute_multi_specialist_availability` query count is ~`1 + 3*N`**
+  (§ Stage 6.H decisions) — one query for `_fetch_qualifying_specialists`,
+  plus `compute_candidate_start_times`'s own three queries per qualifying
+  specialist. Confirmed exact, not just an upper bound: every specialist
+  reaching the loop is already `is_active=True`, so `compute_open_windows`'s
+  own `is_active` early return, which would otherwise skip those three
+  queries, never fires. Accepted N+1 for now; revisit if salons routinely
+  have many specialists per service. Tests assert this as a formula of N,
+  not a fixed number.
 
 ## Overall style
 
@@ -1469,3 +1478,68 @@ above ("Reversed 2026-08-15").
   only currently-employed specialists to the customer, for the same reason:
   nobody should be offered to book someone who no longer works at the salon
   (§ Stage 5 decisions).
+
+### Stage 6.H decisions (multi-specialist availability composition)
+
+Decided 2026-08-15, before implementation. No separate 6.H design proposal
+preceded this section — these decisions came directly out of discussion and
+are recorded here as agreed, not resolved against a prior written proposal.
+
+- **New function `compute_multi_specialist_availability(service, salon,
+  date_from, date_to, now) -> dict[dt.datetime, list[Specialist]]`, calling
+  the existing `compute_candidate_start_times` once per qualifying
+  specialist and merging the results into `{start_time: [specialists free
+  then]}`.** Consumed by both endpoints from § Stage 6.G decisions: the
+  "any specialist" (time-grid) endpoint takes the sorted keys; the second
+  (chosen-time) endpoint calls this same function again and reads the value
+  for the chosen time — it does not call a different, narrower function.
+  The mapping is not persisted between the two calls; each call recomputes
+  it from scratch, per § Stage 6.G's "always re-computes... never reuses a
+  cached result" decision. Recomputing per call is the deliberate cost of
+  that freshness choice, not incidental waste — the alternative (persisting
+  the first call's mapping and looking up the chosen time in it) is exactly
+  the token/stored-computation shape § Stage 6.G already rejected.
+- **Imperative shell / pure core split, matching the rest of this module.**
+  `_fetch_qualifying_specialists(service: Service) -> QuerySet[Specialist]`
+  is the only ORM-touching part — one query,
+  `Specialist.objects.filter(services=service, is_active=True)`, already
+  tenant-scoped via `TenantScopedManager`. No `.distinct()`:
+  `SpecialistService`'s `UniqueConstraint(fields=["specialist", "service"])`
+  already rules out more than one join row per specialist for a given
+  `service`, so the filter can't produce duplicate `Specialist` rows to
+  begin with. Merging is a separate pure function,
+  `_merge_specialist_availability`, over in-memory `(specialist, times)`
+  pairs — no DB, no tenant context — unit-testable the same way
+  `_merge_intervals` is. It sorts keys explicitly, `dict(sorted(...))`:
+  plain dicts preserve insertion order but do not sort themselves, so the
+  ascending-key guarantee (§ Stage 6.G's return-shape expectations) has to
+  be produced deliberately, not assumed from iteration order.
+- **Mapping value is full `Specialist` objects, not ids — no lazy-load
+  optimization now.** The second endpoint needs the full row to serialize
+  photo and description (the reason for the response-shape reversal, §
+  Stage 6 decisions). Optimizing the fetch (e.g. `select_related`/deferred
+  fields) waits until an actual serializer shows a real cost — the same
+  "correctness first, optimize once it's a demonstrated bottleneck" posture
+  already applied to the availability engine as a whole
+  (`docs/ARCHITECTURE.md` § 6, "Where it lives").
+- **Qualifying specialists are those linked via `SpecialistService` AND
+  `is_active=True`; an inactive specialist never appears in the mapping,
+  under any key.** Zero qualifying specialists returns an empty mapping
+  `{}` — a valid answer, not an error, not an exception (same posture as
+  `compute_open_windows`/`compute_candidate_start_times` returning `[]` for
+  "genuinely nothing available," as opposed to raising). This is a backend
+  data answer only; presenting "no specialists available" to a customer is
+  a frontend concern for a later stage, not something this function or its
+  endpoint decides.
+- **`now` is re-validated on this function's first line, via
+  `timezone.is_naive(now)`, not left to the inner
+  `compute_candidate_start_times` guard.** Reason, precisely: with zero
+  qualifying specialists, the inner function is never called at all, so a
+  naive `now` would otherwise silently produce `{}` — indistinguishable
+  from "genuinely nothing available," the exact failure shape § Stage 6.F's
+  naive-`now` guard was written to prevent for the single-specialist path.
+  Raises a plain `ValueError`, same class and same reasoning as
+  `compute_candidate_start_times`'s own guard (§ Stage 6.F decisions): not
+  a new `DomainError` subclass, because the only way a naive value reaches
+  this function is a caller's code being wrong, not a request or a
+  misconfigured database row.
