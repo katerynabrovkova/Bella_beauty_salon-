@@ -7,4 +7,5 @@ urlpatterns = [
     path("api/v1/salons/<slug:slug>/", include("booking.urls")),
     path("api/v1/salons/<slug:slug>/", include("catalog.urls")),
     path("api/v1/salons/<slug:slug>/", include("specialists.urls")),
+    path("api/v1/salons/<slug:slug>/", include("scheduling.urls")),
 ]
