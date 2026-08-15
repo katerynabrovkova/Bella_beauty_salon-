@@ -1617,6 +1617,13 @@ def test_compute_candidate_start_times_date_from_after_date_to_raises_invalid_da
 def test_compute_candidate_start_times_inactive_specialist_returns_empty(
     salon, specialist, service
 ):
+    """
+    Asserts the is_active=True baseline's full candidate list first, against
+    the exact same fixtures the is_active=False assertion below uses, so a
+    future change that silently starts returning [] regardless of is_active
+    (e.g. a duration/granularity/booking-window regression) can't make this
+    test pass vacuously — it must actually distinguish the two states.
+    """
     monday = dt.date(2026, 8, 17)
     make_working_hours(
         salon=salon,
@@ -1625,18 +1632,32 @@ def test_compute_candidate_start_times_inactive_specialist_returns_empty(
         start_time=dt.time(9, 0),
         end_time=dt.time(18, 0),
     )
+    now = dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+
     with tenant_context(salon.id):
-        specialist.is_active = False
-        specialist.save(update_fields=["is_active"])
-        result = compute_candidate_start_times(
+        active_result = compute_candidate_start_times(
             specialist=specialist,
             service=service,
             salon=salon,
             date_from=monday,
             date_to=monday,
-            now=dt.datetime(2026, 8, 17, 0, 0, tzinfo=UTC),
+            now=now,
         )
-    assert result == []
+    start = dt.datetime(2026, 8, 17, 6, 0, tzinfo=UTC)
+    assert active_result == [start + dt.timedelta(minutes=15 * k) for k in range(32)]
+
+    with tenant_context(salon.id):
+        specialist.is_active = False
+        specialist.save(update_fields=["is_active"])
+        inactive_result = compute_candidate_start_times(
+            specialist=specialist,
+            service=service,
+            salon=salon,
+            date_from=monday,
+            date_to=monday,
+            now=now,
+        )
+    assert inactive_result == []
 
 
 def test_compute_candidate_start_times_occupied_minutes_larger_than_every_window_returns_empty(
