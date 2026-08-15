@@ -293,6 +293,16 @@ computed as part of the union but served separately, from a second lookup
 once a client has chosen a time, not inline with the first response
 (`docs/DECISIONS.md` § Stage 6 and § Stage 6.G decisions).
 
+**Exposed via one `GET` endpoint** taking the service, a date range, and an
+optional specialist: present, it serves the specific-specialist path above
+directly; absent, it serves the any-specialist composition's result. Both
+return the same shape — a list of candidate start times converted to the
+salon's local time — never a list of specialists; which specialists are
+actually free at a chosen time is the second, separate lookup already
+described above. Endpoint path, status-code mapping, and permission class are
+Catalog-precedent detail (`docs/DECISIONS.md` § Stage 4 decisions' endpoint
+lists), not restated here — see `docs/DECISIONS.md` § Stage 6.I decisions.
+
 **Where it lives:** `scheduling`, as a stateless service function, not a persisted
 "slots" table. This is a deliberate correctness-over-performance call: a materialized
 slot table needs invalidation on every write to `WorkingHours`, `TimeOff`, and

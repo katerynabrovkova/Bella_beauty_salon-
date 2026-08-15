@@ -1543,3 +1543,118 @@ are recorded here as agreed, not resolved against a prior written proposal.
   a new `DomainError` subclass, because the only way a naive value reaches
   this function is a caller's code being wrong, not a request or a
   misconfigured database row.
+
+### Stage 6.I decisions (availability time-grid GET endpoint)
+
+Decided 2026-08-15, before implementation. No separate design proposal
+preceded this section — these decisions came directly out of a planning pass
+over § Stage 6 decisions, § Stage 6.G decisions, § Stage 6.H decisions above,
+`docs/ARCHITECTURE.md` § 6, `CLAUDE.md`, and the catalog/specialists `views.py`/
+`serializers.py`/`urls.py` as the closest read-endpoint precedent — and are
+recorded here as agreed, not resolved against a prior written proposal.
+
+- **One `GET` endpoint, `/api/v1/salons/<slug>/availability/`, under the
+  existing tenant path prefix.** Required query params `service` (int) and
+  `date_from`/`date_to` (ISO dates); optional `specialist` (int). `specialist`
+  present → the "specific specialist" path, a direct
+  `compute_candidate_start_times` call; `specialist` absent → the "any
+  specialist" path, `compute_multi_specialist_availability`, with the
+  response taking its sorted keys. The response is **identical** in both
+  modes — a list of start times, never a list of specialists (§ Stage 6
+  decisions, "Reversed 2026-08-15"); who's free at a chosen time stays the
+  second endpoint's job (§ Stage 6.G decisions).
+- **Response shape: `{"available_times": [...]}`, not a bare top-level
+  array.** Every other endpoint in this API returns a JSON object at the top
+  level (DRF's pagination wraps list endpoints in `{"count", "next",
+  "previous", "results"}`); a lone bare-array endpoint would be the only
+  shape inconsistency in the API, for no benefit, and an object leaves room
+  for metadata (e.g. a salon timezone name) if a future stage needs it,
+  without a breaking shape change later. Each time is a salon-local ISO 8601
+  string — `candidate.astimezone(ZoneInfo(salon.timezone)).isoformat()` — the
+  UTC offset is embedded in `isoformat()`'s own output, so no separate
+  timezone field is needed to interpret it. **This is where the
+  previously-pending Stage 6 "local-time conversion" item lands**
+  (`docs/ARCHITECTURE.md` § 6 step 5) — in this endpoint's serializer/
+  response, not as a change to any `scheduling/services.py` function; every
+  service function keeps returning UTC `dt.datetime`s, exactly as today.
+- **Query-param validation is a plain `serializers.Serializer`, not a
+  `ModelSerializer`.** There's no model instance to serialize — this is the
+  first view in the codebase backed by a computed value rather than an ORM
+  row. `service`/`specialist` are `PrimaryKeyRelatedField`s, rebound in
+  `__init__` to the tenant-scoped querysets (`Service.objects.all()` /
+  `Specialist.objects.all()`) — the same pattern `catalog/serializers.py`'s
+  `ServiceSerializer.category_id` already uses, not the `.child_relation`
+  variant, since neither field is `many=True`. **The existing query-param
+  precedent, catalog's `category` list filter, does not apply here and is
+  not being extended.** That filter is an optional refinement, silently
+  ignored when malformed (`category_id.isdigit()`) — a reasonable degrade
+  for a param that only narrows an otherwise-valid response. `service`/
+  `date_from`/`date_to` here are required and load-bearing for the
+  computation itself; silently degrading a malformed one would produce a
+  wrong-shaped answer, not a graceful no-op — so malformed input must
+  hard-fail via the serializer instead.
+- **HTTP status mapping — all through the existing `core/exceptions.py`
+  handler, with no view-level `try`/`except`:**
+  - Missing or malformed `service`/`specialist`/`date_from`/`date_to` → 400
+    (an ordinary DRF `ValidationError` from the query serializer, caught by
+    the handler's existing generic branch).
+  - Unknown or cross-tenant `service`/`specialist` id → 400, **not 404.**
+    These are query-param references resolved against a tenant-scoped
+    queryset, the same role `category_id` plays in `ServiceSerializer` — not
+    the URL's own addressed resource, where a miss legitimately is a 404
+    (`catalog`/`specialists`' `RetrieveUpdateDestroyAPIView`s).
+    `TenantScopedManager` already makes a cross-tenant id indistinguishable
+    from a nonexistent one at the query level, so both surface as the
+    field's ordinary "does not exist" `ValidationError` — the same 400 as
+    any other invalid id, not a cross-tenant leak, per CLAUDE.md's
+    `category_id` precedent.
+  - `InvalidDateRangeError` (`date_from > date_to`) → 400, already wired
+    (`status_code = 400` on the class, § Stage 6.C decisions). The view does
+    **not** re-check `date_from <= date_to` itself before calling the
+    service — that check stays the service layer's job, so there is exactly
+    one place, and one error shape, for that condition.
+  - `InvalidSteppingParametersError` → 500, already wired (§ Stage 6.E
+    decisions) — server/data misconfiguration, not a malformed request. The
+    view does nothing special; the `DomainError` passes straight through the
+    shared handler.
+  - A naive `now` reaching a service function raises a plain `ValueError` →
+    500, but this is **unreachable in practice**: `timezone.now()` under
+    `USE_TZ = True` (`config/settings/base.py`) is always aware, and the view
+    is the sole call site (last bullet below). No view-level code guards
+    against it; if it ever fired, the handler's existing catch-all
+    (`logger.exception` + the generic `internal_error` 500 envelope) already
+    covers it correctly, as our bug rather than the client's.
+- **`permission_classes = [AllowAny]`, set explicitly on the class.**
+  `DEFAULT_PERMISSION_CLASSES` (`config/settings/base.py`) is
+  `IsAuthenticated` globally — every existing public-read view (catalog,
+  specialists) already overrides this explicitly for `SAFE_METHODS`, and
+  omitting the override here would silently block the unauthenticated
+  browsing this endpoint exists for (a customer checking availability before
+  ever creating an account). No `get_permissions()`/`SAFE_METHODS` branching
+  is needed, unlike catalog's/specialists' mixins — this endpoint is
+  `GET`-only, so there is no write path to branch away from.
+- **`specialist` in the direct-mode is resolved via `Specialist.objects.all()`
+  (tenant-scoped), not filtered by `is_active`.** A deactivated specialist's
+  id already yields `[]` from `compute_open_windows`'s own `is_active` guard
+  (§ Stage 6.C decisions, "guarded in two places") — filtering it out at the
+  view/serializer level would instead turn "no free times" into a 400
+  "doesn't exist," the wrong failure mode for a legitimate, if empty,
+  answer. The § Stage 6.G `is_active` pick-list rule is a different concern
+  — which specialists a customer is offered to *choose from* on the
+  pick-list screen — not what happens when a specific id is passed directly,
+  which this endpoint's specific-specialist mode does. For the
+  any-specialist path, `is_active` is already filtered inside
+  `_fetch_qualifying_specialists` (§ Stage 6.H decisions); no additional
+  view-level filtering is needed there either.
+- **The view resolves the full `Salon` row, not only the tenant id.**
+  `compute_candidate_start_times`/`compute_multi_specialist_availability`
+  need `salon.timezone`, `salon.min_lead_time_hours`, `salon.max_advance_days`,
+  and `salon.slot_granularity_minutes` — every existing view only ever
+  touches `core.tenancy.get_current_salon_id()` (an int), so this is new:
+  `get_object_or_404(Salon, pk=get_current_salon_id())`. `Salon.objects` is
+  a plain, non-tenant-scoped manager — `Salon` is the tenant root, not a
+  `TenantScopedModel` (`tenants/models.py`'s own docstring: "Not itself a
+  TenantScopedModel — a Salon doesn't belong to a tenant, it is one").
+  `now = timezone.now()` is called exactly once, here in the view, and
+  passed explicitly into both service functions — the single I/O call site
+  the no-default-`now` design was built around (§ Stage 6.F decisions).
