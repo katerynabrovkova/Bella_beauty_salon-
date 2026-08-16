@@ -1658,3 +1658,56 @@ recorded here as agreed, not resolved against a prior written proposal.
   `now = timezone.now()` is called exactly once, here in the view, and
   passed explicitly into both service functions — the single I/O call site
   the no-default-`now` design was built around (§ Stage 6.F decisions).
+
+### Specialist photos — resolved (Stage 6.J)
+
+**Field shape (settled now):** `photo = CharField(max_length=1024, null=True, blank=True)` on the `Specialist` model.
+
+**Field type — CharField, not ImageField:** `ImageField`/`FileField` are coupled
+to Django's storage machinery (`DEFAULT_FILE_STORAGE`, `MEDIA_ROOT`/`MEDIA_URL`,
+Pillow validation, `.save()` via `request.FILES`) — all of which activates at
+upload time, and there is no upload at Stage 6. The DB stores only the object
+key (a string like `salons/42/specialists/17.jpg`), so `CharField` states the
+truth: a text identifier, not a Django-managed file.
+
+**Storage:** photos live in S3-compatible object storage; the DB holds only the
+key, never the bytes. PostgreSQL is not a file server — `bytea` bloats the table
+and every backup, and serving images through Django kills performance. DB knows
+*where*, object storage (via CDN) serves *what*. Files-in-DB rejected: only
+justified for tiny blobs or hard transactional coupling; avatars are neither.
+
+**max_length = 1024:** taken from the S3 limit (an object key is ≤1024 bytes),
+NOT computed from our own key schema — because the real key schema doesn't exist
+yet (upload deferred), and sizing from a guess would freeze that guess into the
+DB. Binding to the storage limit is honest and survives whatever schema we
+eventually choose.
+
+**null=True, blank=True (not empty string):** the API returns `photo: null`, not
+`""`. JSON `null` conveys "no photo" more precisely, and the frontend checks
+`photo === null` cleanly. Django's "no null on string fields" convention guards
+against NULL-vs-"" ambiguity — removed here by simply never writing `""`.
+
+**Optionality:** optional; the specialist and salon owner decide together, most
+will have one. Creating a specialist is never blocked by a missing photo.
+
+**Placeholder is a frontend concern:** absence of a photo is rendered by Next.js
+as a grey-silhouette avatar (social-media style). The backend returns `null`
+honestly and never invents a default-image URL — otherwise it would know about
+the visual, and changing the silhouette would mean a backend change instead of
+CSS. Same principle as local-time and formatting: backend returns the fact,
+frontend renders the look.
+
+**Field added now, not hardcoded in the serializer:** the field goes into the
+model as a small migration (first step of this sub-step), rather than serving a
+constant `null` from the serializer. A `null` constant would make the serializer
+expose a field the model lacks — the source of truth would be a hardcode, not
+the schema — and it would be two serializer edits (add constant now, replace
+with real field at upload stage) instead of one cheap `ADD COLUMN NULL`
+migration. The response shape is identical either way; there is no client-side
+gain to justify the desync.
+
+**Real upload deferred:** the model field and response shape are settled now,
+but actual file upload (object-storage wiring, presigned URLs, upload endpoint)
+is NOT built at Stage 6 — it's infrastructure, not part of the availability
+engine, and belongs to a later dedicated stage. At Stage 6 every specialist
+returns `photo: null`; the second endpoint serialises it as-is.
