@@ -1708,3 +1708,93 @@ but actual file upload (object-storage wiring, presigned URLs, upload endpoint)
 is NOT built at Stage 6 — it's infrastructure, not part of the availability
 engine, and belongs to a later dedicated stage. At Stage 6 every specialist
 returns `photo: null`; the second endpoint serialises it as-is.
+
+### Stage 6.K decisions (specialist-availability endpoint — second lookup, time → specialists)
+
+Decided 2026-08-16, before implementation. No separate design proposal
+preceded this section — these decisions came directly out of a planning pass
+over § Stage 6 decisions, § Stage 6.G decisions, § Stage 6.H decisions, §
+Stage 6.I decisions above, and are recorded here as agreed, not resolved
+against a prior written proposal.
+
+- **One `GET` endpoint, `/api/v1/salons/<slug>/availability/specialists/`, the
+  second of the two availability endpoints, under the same `/availability/`
+  path as the time-grid endpoint (§ Stage 6.I decisions)** — the two are kept
+  together because they are two halves of one booking flow, not two
+  unrelated resources. `permission_classes = [AllowAny]`, set explicitly on
+  the class, same reasoning as § Stage 6.I decisions: `DEFAULT_PERMISSION_CLASSES`
+  is `IsAuthenticated` globally, so a client browsing before registering
+  would be silently blocked without this override.
+- **Purpose: step 2 of the "any specialist" flow.** The client already picked
+  a time from the grid (§ Stage 6.I decisions' response); this endpoint
+  answers *who* is free at that exact time, returning each qualifying
+  specialist with the fields needed to render a chooser card. This is the
+  second half of the reversal decided in § Stage 6 decisions ("Reversed
+  2026-08-15"): time first, specialist second.
+- **Query params: `service` (required, int) and `datetime` (required, ISO
+  8601 with offset, e.g. `2026-08-20T14:00:00+03:00`) — the exact string the
+  first endpoint returned, echoed back unchanged by the client.** Validated
+  via a plain `serializers.Serializer` over `request.query_params`, not a
+  `ModelSerializer` — there is no instance to serialize, same reasoning as §
+  Stage 6.I decisions. `service` is a `PrimaryKeyRelatedField` rebound in
+  `__init__` to the tenant-scoped queryset (`Service.objects.all()`), the
+  same pattern as `ServiceSerializer.category_id` and § Stage 6.I decisions'
+  own `service`/`specialist` fields. `datetime` is a plain DRF
+  `DateTimeField`, which parses ISO-with-offset out of the box — no custom
+  parsing needed.
+- **Datetime contract: the client sends back the local-time ISO string it
+  received, offset included; the view converts to UTC internally to match
+  the mapping's keys (which are UTC).** "Echo back what you received" is the
+  simplest, most error-resistant contract available — the client never
+  computes timezones itself. The explicit offset also disambiguates the
+  moment on a DST-transition day, where a bare local time can be ambiguous
+  or non-existent (§ Open questions, "Local-time presentation across a DST
+  transition"), and a client bug that sends the wrong salon's offset
+  surfaces as an empty result rather than silently matching the wrong slot.
+- **How one `datetime` maps onto the range-based engine:** the endpoint
+  takes a single moment, but `compute_multi_specialist_availability` (§
+  Stage 6.H decisions) works over a date range. The view derives the date
+  from the submitted `datetime`, in the salon's timezone, and calls the
+  engine with `date_from == date_to ==` that date — computing the one-day
+  mapping — then selects the mapping value for the exact submitted moment,
+  compared in UTC. The contract stays simple on the outside; the range
+  mechanics stay internal.
+- **Always recomputes: no cached result from the first endpoint is reused.**
+  There is no server-stored state between the two calls — they are two
+  separate HTTP requests, each computing fresh from the current state of
+  `Appointment`/`TimeOff`/`WorkingHours`. Freshness is chosen over
+  cross-step consistency, the same trade-off § Stage 6 decisions ("Reversed
+  2026-08-15") already made for the two-step flow as a whole, and the same
+  "always re-computes... never reuses a stored computation" rule § Stage 6.H
+  decisions restates for the first endpoint.
+- **Response shape: `{"specialists": [{"photo": ..., "name": ..., "bio":
+  ...}, ...]}`, not a bare top-level array.** Consistent with the time-grid
+  endpoint's `{"available_times": [...]}` (§ Stage 6.I decisions) and with
+  DRF's pagination convention; an object leaves room for metadata later
+  without a breaking shape change. Each specialist serialises exactly three
+  fields: `photo` (the S3 object key, `null` for now — no upload flow yet, §
+  Stage 6.J), `name`, `bio`. Order follows the mapping's specialist order,
+  which is `Specialist.Meta.ordering`, `["name", "id"]`.
+- **Experience/seniority is not a field here.** It lives in free-text `bio`
+  for now, not a structured field — see § Open questions, "Specialist
+  experience/seniority as a structured field," for the deferred decision and
+  why.
+- **An empty result is valid, not an error.** If the chosen time was taken
+  between the two steps (a booking race), the mapping has no entry for that
+  moment, and the endpoint returns `{"specialists": []}` with HTTP 200, not
+  a 4xx/5xx. The human-facing "this time was just taken, pick another" copy
+  is the frontend's job; the backend returns `[]` as plain data, the same
+  "genuinely nothing available" shape § Stage 6.H decisions already
+  distinguishes from an error.
+- **Error contract is inherited from § Stage 6.I decisions, entirely through
+  `core/exceptions.py`'s handler, no view-level `try`/`except`:**
+  - Missing or malformed `service`/`datetime` → 400 (ordinary DRF field
+    validation).
+  - Unknown or cross-tenant `service` id → 400, not 404 — the id is a query
+    *parameter*, not the URL's own addressed resource, and
+    `TenantScopedManager` makes a cross-tenant id indistinguishable from a
+    nonexistent one at the query level, so both surface as the same
+    ordinary "does not exist" 400, per CLAUDE.md's `category_id` precedent
+    (also § Stage 6.I decisions).
+  - `InvalidDateRangeError` cannot arise here: `date_from == date_to` by
+    construction, so the condition it guards against never occurs.
