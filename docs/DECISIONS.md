@@ -60,13 +60,6 @@ on them, rather than being forgotten and improvised in the moment.
   salon.** Currently path prefix only (Stage 3 middleware, § Multi-tenancy
   below). Adding domain-based resolution would be additive to the existing
   middleware, not a rewrite. Decision needed before the public frontend stage.
-- **Specialist photos: storage, upload flow, and whether the public frontend
-  needs them at all.** `docs/ARCHITECTURE.md` listed a `photo` field on
-  `Specialist` from the original Stage 1 design pass, but it was never
-  implemented in any migration (confirmed against the Stage 2 domain-model
-  commits) and Stage 5 explicitly leaves it out. Needs a decision — image
-  storage/CDN choice, who is allowed to upload, whether it's required or
-  optional per specialist — before the frontend specialist pages (Stage 13).
 - **Salon-level closure/holiday model.** No salon-wide closure exists today —
   only per-specialist `TimeOff` (§ Stage 6 decisions). Needed before the
   admin calendar stage (Stage 19/20), which is where staff would actually
@@ -174,14 +167,6 @@ on them, rather than being forgotten and improvised in the moment.
   "at least one specialist free" would then mean free for *that
   specialist's own* duration, not a shared one, which changes what a bare
   time in the response actually promises.
-- **The response-shape reversal (§ Stage 6 decisions, "Reversed
-  2026-08-15") leans on specialists having a photo and a description shown
-  together on their own screen.** The description alone justifies moving
-  the specialist list to a second step; photos are not decided at all —
-  storage/CDN choice, upload flow, and whether the public frontend needs
-  them are still open (§ Open questions, "Specialist photos," above).
-  Cross-linked here so the second-step specialist-picker screen isn't
-  designed assuming photos exist before that question resolves.
 - **`compute_multi_specialist_availability` query count is ~`1 + 3*N`**
   (§ Stage 6.H decisions) — one query for `_fetch_qualifying_specialists`,
   plus `compute_candidate_start_times`'s own three queries per qualifying
