@@ -176,6 +176,18 @@ on them, rather than being forgotten and improvised in the moment.
   queries, never fires. Accepted N+1 for now; revisit if salons routinely
   have many specialists per service. Tests assert this as a formula of N,
   not a fixed number.
+- **Specialist experience/seniority as a structured field.** Today experience is
+  not modelled — a specialist can mention years of experience in the free-text
+  `bio` field, but there is no structured `experience_years` (or similar) on the
+  `Specialist` model. The Stage 6.J specialist-picker mockup showed both options;
+  the free-text approach was chosen for Stage 6 because seniority is a specialist-
+  profile concern, not an availability-engine one, and adding a field mid-Stage-6
+  would pull in its own sub-decisions. A structured field is wanted later (frontend
+  specialist-profile / admin stage, ~Stage 13). Key sub-decision when it lands:
+  store a raw number ("8 years") vs. a career-start date/year. A raw number freezes
+  and goes stale (it will still read "8" two years on); a start date recomputes
+  itself and never lies — lean toward the date. Decide before the specialist-profile
+  frontend stage.
 
 ## Overall style
 
