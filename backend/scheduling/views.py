@@ -15,6 +15,7 @@ its status entirely through the existing core.exceptions.exception_handler,
 already wired as DRF's global EXCEPTION_HANDLER.
 """
 
+import datetime as dt
 from zoneinfo import ZoneInfo
 
 from django.shortcuts import get_object_or_404
@@ -25,7 +26,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from core.tenancy import get_current_salon_id
-from scheduling.serializers import AvailabilityQuerySerializer
+from scheduling.serializers import (
+    AvailabilityQuerySerializer,
+    SpecialistAtTimeSerializer,
+    SpecialistsAtTimeQuerySerializer,
+)
 from scheduling.services import (
     compute_candidate_start_times,
     compute_multi_specialist_availability,
@@ -88,3 +93,46 @@ class AvailabilityView(APIView):
         salon_tz = ZoneInfo(salon.timezone)
         available_times = [candidate.astimezone(salon_tz).isoformat() for candidate in candidates]
         return Response({"available_times": available_times})
+
+
+class SpecialistsAtTimeView(APIView):
+    """
+    The second availability endpoint (§ Stage 6.K decisions): given a
+    service and a single chosen moment, who is free then. AllowAny for the
+    same reason as AvailabilityView above.
+    """
+
+    permission_classes = [AllowAny]
+
+    def get(self, request: Request, *args: object, **kwargs: object) -> Response:
+        query = SpecialistsAtTimeQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        service = query.validated_data["service"]
+        # The client echoes back the local-time ISO string the time-grid
+        # endpoint returned; converted to UTC here to match
+        # compute_multi_specialist_availability's UTC-keyed mapping (§
+        # Stage 6.K decisions' datetime contract).
+        submitted_at = query.validated_data["datetime"].astimezone(dt.UTC)
+
+        salon = get_object_or_404(Salon, pk=get_current_salon_id())
+        now = timezone.now()
+
+        # The endpoint takes one moment, but the engine works over a date
+        # range: the date is derived from the submitted instant in the
+        # salon's own local timezone, not from its UTC date, then passed as
+        # a single-day date_from == date_to range (§ Stage 6.K decisions).
+        salon_tz = ZoneInfo(salon.timezone)
+        local_date = submitted_at.astimezone(salon_tz).date()
+
+        mapping = compute_multi_specialist_availability(
+            service=service,
+            salon=salon,
+            date_from=local_date,
+            date_to=local_date,
+            now=now,
+        )
+        # A missing key means genuinely nobody free at that exact moment
+        # (e.g. a booking race between the two steps) — a valid empty
+        # answer, not an error (§ Stage 6.K decisions).
+        specialists = mapping.get(submitted_at, [])
+        return Response({"specialists": SpecialistAtTimeSerializer(specialists, many=True).data})

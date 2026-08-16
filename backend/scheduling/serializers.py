@@ -5,6 +5,9 @@ not a ModelSerializer — there's no model instance to serialize here, only
 request.query_params to validate.
 """
 
+import datetime as dt
+
+from django.utils import timezone
 from rest_framework import serializers
 
 from catalog.models import Service
@@ -42,3 +45,58 @@ class AvailabilityQuerySerializer(serializers.Serializer):
         super().__init__(*args, **kwargs)
         self.fields["service"].queryset = Service.objects.all()
         self.fields["specialist"].queryset = Specialist.objects.all()
+
+
+class _OffsetRequiredDateTimeField(serializers.DateTimeField):
+    """
+    Rejects a naive input instead of DRF's normal behavior under
+    `USE_TZ = True` — silently treating it as the project's default
+    timezone (§ Stage 6.K decisions). The offset exists precisely to
+    disambiguate the submitted moment on a DST-transition day; silently
+    defaulting a naive value would reintroduce exactly that ambiguity.
+    `enforce_timezone` is the DRF hook that receives the parsed value before
+    any such default is applied, so the naive/aware distinction the client
+    actually sent is still visible here.
+    """
+
+    def enforce_timezone(self, value: dt.datetime) -> dt.datetime:
+        if not timezone.is_aware(value):
+            raise serializers.ValidationError(
+                "Datetime must include a UTC offset (e.g. '+03:00').", code="naive"
+            )
+        return super().enforce_timezone(value)
+
+
+class SpecialistsAtTimeQuerySerializer(serializers.Serializer):
+    """
+    Query-param validation for the specialist-availability GET endpoint
+    (docs/DECISIONS.md § Stage 6.K decisions) — same reasoning as
+    AvailabilityQuerySerializer above: a plain serializers.Serializer, not a
+    ModelSerializer, and both fields are required and load-bearing rather
+    than an optional, silently-degrading refinement.
+
+    `service` is a PrimaryKeyRelatedField rebound in __init__ to the
+    tenant-scoped queryset, the same pattern as AvailabilityQuerySerializer.
+    `datetime` is the offset-required field above, not a plain
+    serializers.DateTimeField.
+    """
+
+    service = serializers.PrimaryKeyRelatedField(queryset=Service.unscoped_objects.none())
+    datetime = _OffsetRequiredDateTimeField()
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.fields["service"].queryset = Service.objects.all()
+
+
+class SpecialistAtTimeSerializer(serializers.ModelSerializer):
+    """
+    Response shape for a single specialist entry (§ Stage 6.K decisions):
+    exactly photo/name/bio, nothing else. A ModelSerializer here, unlike the
+    query serializers above — this one does serialize a real `Specialist`
+    instance, not just validate query params.
+    """
+
+    class Meta:
+        model = Specialist
+        fields = ["photo", "name", "bio"]
