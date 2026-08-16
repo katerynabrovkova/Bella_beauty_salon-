@@ -1751,6 +1751,16 @@ against a prior written proposal.
   or non-existent (§ Open questions, "Local-time presentation across a DST
   transition"), and a client bug that sends the wrong salon's offset
   surfaces as an empty result rather than silently matching the wrong slot.
+- **A naive `datetime` (no UTC offset) is rejected with 400, not silently
+  defaulted.** DRF's `DateTimeField` under `USE_TZ = True` doesn't reject a
+  naive input by default — it silently makes it aware using the project's
+  default timezone, which would reintroduce exactly the ambiguity the
+  offset requirement above exists to remove. Enforced via
+  `scheduling/serializers.py`'s `_OffsetRequiredDateTimeField`, a
+  `DateTimeField` subclass overriding `enforce_timezone` — the DRF hook
+  that receives the parsed value before any such default is applied — to
+  raise `ValidationError` when `timezone.is_aware(value)` is false, before
+  delegating to the normal behavior otherwise.
 - **How one `datetime` maps onto the range-based engine:** the endpoint
   takes a single moment, but `compute_multi_specialist_availability` (§
   Stage 6.H decisions) works over a date range. The view derives the date
