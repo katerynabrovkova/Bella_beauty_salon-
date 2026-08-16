@@ -12,6 +12,7 @@ class Specialist(TenantScopedModel, TimeStamped):
     # absence (vacation, sick leave, parental leave) is TimeOff rows, never
     # a status here (docs/DECISIONS.md § Stage 5 decisions).
     is_active = models.BooleanField(default=True)
+    photo = models.CharField(max_length=1024, null=True, blank=True)
 
     services: "models.ManyToManyField[Service, SpecialistService]" = models.ManyToManyField(
         Service, through="SpecialistService", related_name="specialists"
