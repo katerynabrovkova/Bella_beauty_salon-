@@ -1958,3 +1958,87 @@ Recorded here as agreed.
   error of its own — the tests would start exercising the wrong code path
   instead of failing loudly. A rename of either name must update
   `tests/test_booking_create_appointment.py` in the same change.
+
+### Stage 7.C-bis decisions (guest booking orchestrator)
+
+Decided 2026-08-17, following a design-analysis proposal (read against
+`docs/ARCHITECTURE.md` § 2, § 3, and `docs/DECISIONS.md` § Identity, §
+Stage 3 sub-step 3 decisions, § Stage 7.C decisions) that was reviewed and
+approved before any code was written, per CLAUDE.md's stage workflow.
+Recorded here as agreed.
+
+- **Scope: the orchestrator `create_guest_appointment`, guest path only.**
+  Lives in `booking/services.py` — the end product is a booking, and
+  `booking` already depends on `accounts` (via `Customer`), never the
+  reverse, so the orchestrator calls into `accounts` for the `Customer`
+  step rather than the other way around. It wraps guest `Customer`
+  get-or-create, the § Stage 7.C core `create_appointment`, and
+  `GuestAccessToken` issuance in one `transaction.atomic()`. A
+  registered-user path (`Customer` already linked to a `User`, no email
+  get-or-create, no guest token) is a separate later step, not designed or
+  implemented here.
+- **Signature: `create_guest_appointment(*, salon, specialist, service,
+  start_datetime, now, customer_name, customer_email, customer_phone) ->
+  tuple[Appointment, str]`.** Returns `(Appointment, raw_token)`. The raw
+  token is returned because the guest has no login and the only other
+  place it will ever surface is a future Stage 9 confirmation email —
+  whether the § Stage 7.D `POST` endpoint puts it in the response body in
+  the meantime, or holds it back until Stage 9 exists, is a 7.D decision,
+  deliberately **not** decided here.
+- **Calls, in order, inside one outer `transaction.atomic()`:**
+  `accounts.services.get_or_create_guest_customer(...)` (new, this
+  sub-step) → `create_appointment(...)` (existing § Stage 7.C core, same
+  module) → `booking.guest_tokens.issue_guest_token(appointment)` (already
+  exists — built in Stage 3 anticipating exactly this call).
+- **Transaction: the outer `atomic()` is the entire source of the
+  "no orphaned `Customer` / no appointment without a token" guarantee.**
+  `ATOMIC_REQUESTS` is not set anywhere in settings, so there is no
+  request-level atomicity to lean on — this function's own `atomic()`
+  block is load-bearing, not a redundant layer on top of something the
+  framework already provides. `create_appointment`'s own internal
+  `atomic()` (§ Stage 7.C decisions, "Double-booking prevention") nests as
+  a savepoint inside this outer one; Django's `atomic()` nests
+  arbitrarily, and § Stage 7.C's own transaction-atomicity test already
+  proved a nested `IntegrityError` doesn't poison the surrounding
+  transaction one level up from pytest-django's test-wrapping transaction
+  — nesting a second level here adds no new risk.
+- **Customer get-or-create semantics, decided: overwrite name/phone on
+  every booking, unconditionally (option A).** On a returning guest (email
+  already has a `Customer` row in this salon), the newly-supplied
+  `customer_name`/`customer_phone` overwrite the stored row's values every
+  time, not just on first booking. This is the most direct reading of
+  `docs/ARCHITECTURE.md` § 3 / `docs/DECISIONS.md` § Identity ("a returning
+  guest updates their existing row") and the simplest rule to state — no
+  per-field conditional logic. **The risk is real and is recorded, not
+  hidden**: a typo, or a guest booking on behalf of someone else under
+  their own email, silently overwrites previously-correct name/phone data.
+  Chosen over never-overwrite (option B) because A has a self-correction
+  path — a wrong value written today is corrected automatically by the
+  guest's next booking — whereas B's stale data never refreshes, and a
+  login-less guest has no other way to fix it until account features exist
+  (Stage 13+). Rejected fill-only-blank-fields (option C) as introducing a
+  "first write wins per field" rule that isn't stated anywhere in the docs
+  and would need its own justification.
+- **Get-or-create must use Django's ORM `get_or_create()`, not a
+  hand-written check-then-create.** The `(salon, email)` unique constraint
+  (`customer_salon_email_uniq`) plus `get_or_create()`'s own internal
+  savepoint-and-retry-on-`IntegrityError` behavior closes the
+  concurrent-same-email race at the DB level with no extra code from this
+  sub-step. That race is pinned by Django's own implementation plus the DB
+  constraint, not by a synthetic thread-based test — same category as the
+  sweep-vs-webhook race (§ Stage 7 decisions) and the exclusion-constraint
+  race already recorded in this file, real races a single-transaction unit
+  test can't exercise without actual concurrency.
+- **`GuestAccessToken` issuance needs no new machinery.**
+  `booking/guest_tokens.py::issue_guest_token` already handles signing
+  (`django.core.signing`), the SHA-256 `token_hash`, `expires_at =
+  appointment.end_datetime + GUEST_TOKEN_VALIDITY` (30 days), and passes
+  `salon` explicitly. The orchestrator only calls it with the just-created
+  `Appointment` and propagates both of its return values.
+- **New code this sub-step will need** (forthcoming — not created by this
+  documentation-only commit): `accounts/services.py`'s
+  `get_or_create_guest_customer(*, salon, name, email, phone) -> Customer`;
+  `booking/services.py`'s `create_guest_appointment`. No new `DomainError`
+  subclasses are anticipated — every failure path funnels through
+  `create_appointment`'s existing `SlotNotOfferedError`/
+  `SlotUnavailableError`, or an unexpected `IntegrityError`.
