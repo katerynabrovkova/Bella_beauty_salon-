@@ -26,7 +26,9 @@ import psycopg
 from django.db import IntegrityError, transaction
 
 from accounts.models import Customer
+from accounts.services import get_or_create_guest_customer
 from booking.constants import SLOT_HOLD_DURATION
+from booking.guest_tokens import issue_guest_token
 from booking.models import ACTIVE_APPOINTMENT_STATUSES, Appointment, AppointmentStatus
 from catalog.models import Service
 from core.exceptions import SlotNotOfferedError, SlotUnavailableError
@@ -115,3 +117,38 @@ def create_appointment(
             if isinstance(exc.__cause__, psycopg.errors.ExclusionViolation):
                 raise SlotUnavailableError() from exc
             raise
+
+
+def create_guest_appointment(
+    *,
+    salon: Salon,
+    specialist: Specialist,
+    service: Service,
+    start_datetime: dt.datetime,
+    now: dt.datetime,
+    customer_name: str,
+    customer_email: str,
+    customer_phone: str,
+) -> tuple[Appointment, str]:
+    """
+    docs/DECISIONS.md § Stage 7.C-bis decisions. Guest path only. The outer
+    transaction.atomic() here is the entire source of the
+    "no orphaned Customer / no appointment without a token" guarantee —
+    ATOMIC_REQUESTS is not set, so there is no request-level atomicity to
+    lean on. create_appointment's own internal atomic() nests as a
+    savepoint inside this one.
+    """
+    with transaction.atomic():
+        customer = get_or_create_guest_customer(
+            salon=salon, name=customer_name, email=customer_email, phone=customer_phone
+        )
+        appointment = create_appointment(
+            salon=salon,
+            specialist=specialist,
+            service=service,
+            customer=customer,
+            start_datetime=start_datetime,
+            now=now,
+        )
+        raw_token, _token_row = issue_guest_token(appointment)
+        return appointment, raw_token
