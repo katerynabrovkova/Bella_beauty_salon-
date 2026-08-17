@@ -69,6 +69,33 @@ class InvalidDateRangeError(DomainError):
     default_message = "The requested date range is invalid."
 
 
+class SlotNotOfferedError(DomainError):
+    """
+    docs/DECISIONS.md § Stage 7.C decisions: `start_datetime` was never an
+    offered candidate at all (outside lead-time/advance window, wrong
+    working hours, inactive specialist, ...) — a frontend-bug/tampered-
+    request signal, distinct from SlotUnavailableError's ordinary booking
+    race. Carries no per-filter reason in its details; the service logs
+    that context server-side instead.
+    """
+
+    code = "SLOT_NOT_OFFERED"
+    status_code = status.HTTP_400_BAD_REQUEST
+    default_message = "This slot is not currently offered."
+
+
+class SlotUnavailableError(DomainError):
+    """
+    docs/DECISIONS.md § Stage 7.C decisions: the slot was valid and offered
+    but someone else took it first — the ordinary booking race, caught by
+    either the application-level re-check or the exclusion constraint.
+    """
+
+    code = "SLOT_NO_LONGER_AVAILABLE"
+    status_code = status.HTTP_409_CONFLICT
+    default_message = "This slot is no longer available."
+
+
 class InvalidSteppingParametersError(DomainError):
     """
     docs/DECISIONS.md § Stage 6.E decisions: granularity_minutes/

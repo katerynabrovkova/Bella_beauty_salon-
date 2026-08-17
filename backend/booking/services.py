@@ -1,0 +1,117 @@
+"""
+Stage 7.C — appointment-creation core (docs/ARCHITECTURE.md § 2, § 7, § 14,
+the State machines section; docs/DECISIONS.md § Stage 7.C decisions).
+Scoped to `create_appointment` only — Customer get-or-create and
+`GuestAccessToken` issuance are 7.C-bis, the `POST` endpoint is 7.D.
+
+Requires tenant context to already be bound (core.tenancy.tenant_context) —
+this function does not bind it itself, same convention as
+scheduling/services.py and specialists/services.py.
+
+`compute_candidate_start_times` is imported here as a bare module-global
+name, and `_has_overlapping_active_appointment` is defined as one, on
+purpose: both are pinned by the double-booking test suite's
+`monkeypatch.setattr(booking.services, "<name>", ...)` calls
+(docs/DECISIONS.md § Stage 7.C decisions, the "two implementation-detail
+names" entry). Do not rename either, or replace the bare import with a
+namespaced module reference, without updating
+tests/test_booking_create_appointment.py in the same change.
+"""
+
+import datetime as dt
+import logging
+from zoneinfo import ZoneInfo
+
+import psycopg
+from django.db import IntegrityError, transaction
+
+from accounts.models import Customer
+from booking.constants import SLOT_HOLD_DURATION
+from booking.models import ACTIVE_APPOINTMENT_STATUSES, Appointment, AppointmentStatus
+from catalog.models import Service
+from core.exceptions import SlotNotOfferedError, SlotUnavailableError
+from scheduling.services import compute_candidate_start_times
+from specialists.models import Specialist
+from tenants.models import Salon
+
+logger = logging.getLogger(__name__)
+
+
+def _has_overlapping_active_appointment(
+    *, specialist: Specialist, start_datetime: dt.datetime, blocked_until: dt.datetime
+) -> bool:
+    """
+    Narrow re-check mirroring the exclusion constraint's own condition
+    (booking/models.py's `appointment_no_overlapping_active_bookings`) — not
+    a re-run of the scheduling engine (docs/DECISIONS.md § Stage 7.C
+    decisions).
+    """
+    return Appointment.objects.filter(
+        specialist=specialist,
+        status__in=ACTIVE_APPOINTMENT_STATUSES,
+        start_datetime__lt=blocked_until,
+        blocked_until__gt=start_datetime,
+    ).exists()
+
+
+def create_appointment(
+    *,
+    salon: Salon,
+    specialist: Specialist,
+    service: Service,
+    customer: Customer,
+    start_datetime: dt.datetime,
+    now: dt.datetime,
+) -> Appointment:
+    """
+    docs/DECISIONS.md § Stage 7.C decisions. Raises SlotNotOfferedError if
+    `start_datetime` isn't among the engine's own candidates for this
+    specialist/service/date, or SlotUnavailableError if it was offered but
+    got taken between that check and the insert (application-level re-check,
+    then the exclusion constraint as the final guard).
+    """
+    local_date = start_datetime.astimezone(ZoneInfo(salon.timezone)).date()
+    candidates = compute_candidate_start_times(
+        specialist=specialist,
+        service=service,
+        salon=salon,
+        date_from=local_date,
+        date_to=local_date,
+        now=now,
+    )
+    if start_datetime not in candidates:
+        logger.warning(
+            "create_appointment: slot not offered "
+            "(specialist_id=%s, start_datetime=%s, candidate_count=%d)",
+            specialist.id,
+            start_datetime.isoformat(),
+            len(candidates),
+        )
+        raise SlotNotOfferedError()
+
+    end_datetime = start_datetime + dt.timedelta(minutes=service.duration_minutes)
+    blocked_until = end_datetime + dt.timedelta(minutes=service.buffer_minutes)
+
+    with transaction.atomic():
+        if _has_overlapping_active_appointment(
+            specialist=specialist, start_datetime=start_datetime, blocked_until=blocked_until
+        ):
+            raise SlotUnavailableError()
+        try:
+            return Appointment.objects.create(
+                salon=salon,
+                customer=customer,
+                specialist=specialist,
+                service=service,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                blocked_until=blocked_until,
+                service_price_at_booking=service.price,
+                deposit_percentage_at_booking=salon.deposit_percentage,
+                hold_expires_at=now + SLOT_HOLD_DURATION,
+                status=AppointmentStatus.PENDING_PAYMENT,
+            )
+        except IntegrityError as exc:
+            if isinstance(exc.__cause__, psycopg.errors.ExclusionViolation):
+                raise SlotUnavailableError() from exc
+            raise
