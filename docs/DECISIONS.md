@@ -1938,3 +1938,23 @@ Recorded here as agreed.
   `DomainError` subclasses in `core/exceptions.py` —
   `SlotNotOfferedError` (400) and `SlotUnavailableError` (409), the latter
   the exact name `docs/ARCHITECTURE.md` § 14 already documents as planned.
+- **Two implementation-detail names are pinned by the red-phase test suite
+  on purpose, the same spirit as a deliberate `# noqa`.** The slot-validity
+  check (above) and the double-booking re-check are redundant for the
+  ordinary, non-racing case — both exclude the same occupied intervals, just
+  at different times relative to `transaction.atomic()` — so a test that
+  wants to exercise the double-booking layers in isolation has to defeat the
+  slot-validity check first via `monkeypatch`, and (for the DB-layer test)
+  the application-level re-check as well. That only works if both are
+  reachable as plain module-global names on `booking.services`, not
+  namespaced through an imported module object. Two names are therefore
+  fixed by that test suite, not free-to-rename internals:
+  `compute_candidate_start_times` must be imported into `booking/services.py`
+  as a bare name (`from scheduling.services import
+  compute_candidate_start_times`), and the private re-check helper must be
+  named `_has_overlapping_active_appointment`. Renaming either, or importing
+  the engine call via a namespaced module reference instead, silently breaks
+  the double-booking tests' `monkeypatch.setattr` calls without raising an
+  error of its own — the tests would start exercising the wrong code path
+  instead of failing loudly. A rename of either name must update
+  `tests/test_booking_create_appointment.py` in the same change.
