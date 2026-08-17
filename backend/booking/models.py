@@ -53,7 +53,7 @@ class Appointment(TenantScopedModel, TimeStamped):
     deposit_percentage_at_booking = models.DecimalField(max_digits=5, decimal_places=2)
 
     # Set at creation only for PENDING_PAYMENT appointments.
-    hold_expires_at = models.DateTimeField(null=True, blank=True)
+    hold_expires_at = models.DateTimeField()
 
     status = models.CharField(
         max_length=32, choices=AppointmentStatus.choices, default=AppointmentStatus.PENDING_PAYMENT

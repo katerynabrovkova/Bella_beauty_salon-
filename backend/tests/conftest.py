@@ -2,8 +2,10 @@ import datetime as dt
 
 import pytest
 from django.core.cache import cache
+from django.utils import timezone
 
 from accounts.models import Customer
+from booking.constants import SLOT_HOLD_DURATION
 from booking.models import Appointment, AppointmentStatus
 from catalog.models import Service, ServiceCategory
 from core.tenancy import tenant_context
@@ -121,9 +123,15 @@ def make_appointment(
     service: Service,
     start: dt.datetime,
     status: str = AppointmentStatus.CONFIRMED,
+    hold_expires_at: dt.datetime | None = None,
 ) -> Appointment:
     end = start + dt.timedelta(minutes=service.duration_minutes)
     blocked_until = end + dt.timedelta(minutes=service.buffer_minutes)
+    # hold_expires_at is NOT NULL on every row regardless of status — a
+    # CONFIRMED appointment still carries the value it got at birth in
+    # PENDING_PAYMENT, just stale and unread past that point.
+    if hold_expires_at is None:
+        hold_expires_at = timezone.now() + SLOT_HOLD_DURATION
     with tenant_context(salon.id):
         return Appointment.objects.create(
             salon=salon,
@@ -135,5 +143,6 @@ def make_appointment(
             blocked_until=blocked_until,
             service_price_at_booking=service.price,
             deposit_percentage_at_booking=salon.deposit_percentage,
+            hold_expires_at=hold_expires_at,
             status=status,
         )
