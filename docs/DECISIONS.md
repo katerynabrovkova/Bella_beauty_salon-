@@ -188,6 +188,48 @@ on them, rather than being forgotten and improvised in the moment.
   and goes stale (it will still read "8" two years on); a start date recomputes
   itself and never lies — lean toward the date. Decide before the specialist-profile
   frontend stage.
+- **Sweep-vs-webhook race on `PENDING_PAYMENT`.** Reached in discussion ahead
+  of Stage 7 — recorded here, not under a "Stage 7 decisions" heading,
+  because Stage 7 hasn't started and this hasn't been through that stage's
+  normal design/review step yet; treat it as a conclusion to revisit, not
+  ratified architecture, when Stage 7 begins. A `PENDING_PAYMENT` appointment
+  can be acted on near-simultaneously by two writers: the expiry sweep
+  (`docs/ARCHITECTURE.md` § 12) moving it `PENDING_PAYMENT → EXPIRED` once
+  `hold_expires_at` passes, and the payment webhook moving it
+  `PENDING_PAYMENT → CONFIRMED` (§ ARCHITECTURE state machines).
+  `PENDING_PAYMENT` at read time is not proof the customer didn't pay — it
+  only means the webhook hasn't arrived yet (payment and the news of payment
+  are separated by network flight time). Conclusion, as four transition
+  rules:
+  1. Both writers take a row lock (`select_for_update`) on the appointment
+     and re-check the row's current status under the lock before applying
+     any transition — a transition is never forced from a status the row is
+     no longer in.
+  2. A sweep that finds the row already `CONFIRMED` does nothing.
+  3. A webhook that finds the row already `EXPIRED` does **not** resurrect
+     the slot (resurrecting could collide with a slot another customer
+     booked in the gap, reintroducing the double-booking § 7 prevents) —
+     instead it initiates a deposit refund and the customer is notified.
+  4. Both transitions are idempotent (a redelivered event is a no-op, not an
+     error), behind the same `ProcessedWebhookEvent` guard as § 8.
+
+  Stage split: the policy above is decided now, but the refund itself is
+  Stage 8 (payments) machinery — Stage 7 has no payment machinery to execute
+  it. Stage 7 must only leave room: the `EXPIRED` transition must not assume
+  payment was absent, and the webhook handler must be able to detect
+  "arrived late, appointment already EXPIRED" and not force `CONFIRMED`; the
+  refund call itself is wired in at Stage 8. Move into § Stage 7 decisions /
+  § Stage 8 decisions (splitting the policy and the refund wiring
+  accordingly) when those stages begin.
+- **Stuck refunds — genuinely open, not decided.** The automatic refund
+  described above depends on the payment provider; `REFUND_PENDING →
+  REFUNDED` (§ ARCHITECTURE state machines) can fail or hang (provider down,
+  error, timeout). With no human in the happy path, nothing today catches a
+  refund that silently stays in `REFUND_PENDING` forever. Needs a decision at
+  Stage 8 on how stuck refunds are detected and retried/surfaced (a sweep
+  over aged `REFUND_PENDING` rows, a staff-visible flag, or similar).
+  Recorded now so it isn't improvised when the automatic-refund path above is
+  built.
 
 ## Overall style
 
