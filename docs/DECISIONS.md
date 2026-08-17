@@ -1846,3 +1846,95 @@ against a prior written proposal.
   payment was absent, and the webhook handler must be able to detect
   "arrived late, appointment already EXPIRED" and not force `CONFIRMED`; the
   refund call itself is wired in at Stage 8.
+
+### Stage 7.C decisions (appointment-creation core)
+
+Decided 2026-08-17, following a design-analysis proposal (read against
+`docs/ARCHITECTURE.md` § 2, § 7, § 14, the State machines section, and
+`docs/DECISIONS.md` § Stage 6.F/6.D decisions) that was reviewed and
+approved before any code was written, per CLAUDE.md's stage workflow.
+Recorded here as agreed.
+
+- **Scope: the core `create_appointment` service function only.** It takes
+  an already-existing `Customer` — `Customer` get-or-create and
+  `GuestAccessToken` issuance are Stage 7.C-bis, which wraps this function
+  and that logic in one shared `transaction.atomic()`. The `POST` endpoint
+  is Stage 7.D. This sub-step designs and implements none of that.
+- **Signature: `create_appointment(*, salon, specialist, service, customer,
+  start_datetime, now) -> Appointment`.** `now` is an explicit parameter
+  with no default, consistent with § Stage 6.F decisions ("`now` is an
+  explicit parameter, with no default and no `None` fallback"): the system
+  clock is I/O, and a default would let a test silently omit it and go
+  green for the wrong reason. Return type is the created `Appointment`;
+  failure is communicated by a raised `DomainError`, the same contract as
+  every other service function in this codebase.
+- **Fields written at creation.** `status = PENDING_PAYMENT`;
+  `hold_expires_at = now + SLOT_HOLD_DURATION` (the § Stage 7.B constant's
+  first real use); `end_datetime = start_datetime +
+  service.duration_minutes`; `blocked_until = end_datetime +
+  service.buffer_minutes`; `service_price_at_booking = service.price` and
+  `deposit_percentage_at_booking = salon.deposit_percentage`, both read
+  from the live `Service`/`Salon` rows *at creation time* and then frozen —
+  the snapshot exists precisely so a later price or deposit-percentage
+  change never rewrites what an already-made booking owes
+  (`docs/ARCHITECTURE.md` § 2, § 8). `salon` is passed explicitly to
+  `.create()`: the tenant-scoped manager filters reads but never injects
+  `salon` on write (the Stage 6 smoke-test finding).
+- **Slot-validity check — the key decision.** The service re-validates that
+  `start_datetime` is actually an offered slot by calling
+  `compute_candidate_start_times` for the given specialist, service, and
+  date, and checking `start_datetime` is among the returned candidates; if
+  not, it raises `SlotNotOfferedError`. The service layer is the last line
+  of truth — callable from views, Celery tasks, and the AI assistant alike
+  — so trusting the caller would leave lead-time, max-advance,
+  `WorkingHours`, `is_active`, and `SpecialistService` qualification
+  unenforced for any non-view caller. One check covers all of those,
+  because they already live inside the engine; the service does not
+  re-implement any of those filters itself. This runs **before**
+  `transaction.atomic()`: it is a read with no need for transactional
+  isolation — validity only needs to be honest as of the request, it is
+  only the slot *claim* below that needs atomicity.
+- **Double-booking prevention, two layers, inside one
+  `transaction.atomic()`, in this order: application-level re-check, then
+  insert.** The re-check is a narrow `Appointment.objects.filter` on the
+  specialist, overlapping `(start_datetime, blocked_until)`, filtered to
+  `ACTIVE_APPOINTMENT_STATUSES` — mirroring the exclusion constraint's own
+  condition, **not** re-running the scheduling engine (`docs/ARCHITECTURE.md`
+  § 7, layer 1). A hit raises `SlotUnavailableError` before any insert is
+  attempted. The exclusion constraint remains the final guard (§ 7, layer
+  2): a resulting `IntegrityError` whose `__cause__` is a psycopg
+  `ExclusionViolation` is caught narrowly — the same pattern
+  `core/exceptions.py` already uses for `UniqueViolation` — and re-raised as
+  the same `SlotUnavailableError`, so the caller can't tell which of the two
+  layers actually fired.
+- **Two distinct domain errors, and why they must stay separate.**
+  `SlotNotOfferedError` (`code=SLOT_NOT_OFFERED`, HTTP 400) means the slot
+  was never an offered candidate at all — outside the lead-time/advance
+  window, wrong specialist, wrong working hours, etc. — which in a healthy
+  frontend flow only fires on a frontend bug or a tampered request.
+  `SlotUnavailableError` (`code=SLOT_NO_LONGER_AVAILABLE`, HTTP 409, § 7)
+  means the slot was valid and offered but someone else took it first — the
+  ordinary booking race. The frontend must branch differently on each
+  (reload the availability grid vs. treat it as a bad request), so
+  conflating them would mislead it. `SlotNotOfferedError` carries **no**
+  per-filter reason in its details — deriving *which* filter rejected the
+  slot would mean re-implementing each filter outside the engine, the same
+  reasoning § Stage 6.D decisions' "blocker provenance" question already
+  decided against for a different endpoint. Instead the service logs the
+  event context server-side (`start_datetime`, specialist, candidate count)
+  for debugging frontend bugs, without exposing the reason to the client.
+- **Cross-tenant safety: the composite tenant FKs are the DB guarantee, not
+  a friendly application-level check.** A genuine cross-salon mismatch
+  (e.g. a `specialist` from a different salon than `salon`) surfaces as an
+  unhandled `IntegrityError` → the generic 500 path, deliberately not given
+  a handler in 7.C — a real caller resolving every object from one
+  tenant-scoped request cannot produce this without a bug elsewhere, the
+  same stance already recorded for `compute_candidate_start_times`'s
+  unchecked `salon` argument (§ Open questions). This is pinned by a test,
+  not "fixed."
+- **New files this sub-step will need** (forthcoming — not created by this
+  documentation-only commit): `booking/services.py`, holding
+  `create_appointment` and its private overlap-check helper; and two new
+  `DomainError` subclasses in `core/exceptions.py` —
+  `SlotNotOfferedError` (400) and `SlotUnavailableError` (409), the latter
+  the exact name `docs/ARCHITECTURE.md` § 14 already documents as planned.
