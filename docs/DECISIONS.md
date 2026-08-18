@@ -2212,3 +2212,123 @@ as agreed.
   entry above. No shared lock helper is factored out with § 7.F yet — 7.E
   builds its own clear pattern here; whether it's worth abstracting is a §
   7.F decision, made by fact once that task exists, not speculatively now.
+
+### Stage 7.F decisions (appointment-expiry sweep)
+
+Decided 2026-08-18 in discussion, before implementation, per CLAUDE.md's
+design-first workflow — read against the current on-disk state of
+`booking/services.py`, `config/celery.py`, `config/settings/base.py`,
+`accounts/tasks.py`, `core/tenancy.py`, and `booking/models.py`, verified
+fresh rather than from memory. Recorded here as agreed.
+
+- **A periodic Celery task expires overdue `PENDING_PAYMENT` appointments.**
+  This is the first live Celery task in the project bound to tenant context
+  at all, and the first periodic (Celery Beat) task of any kind —
+  `accounts/tasks.py`'s three existing tasks are platform-wide User events
+  fired by `.delay()` and bind no tenant context. It is also the first live
+  application of the sweep-vs-webhook race policy (§ Stage 7 decisions).
+- **Structure: a service plus a thin task, same split as 7.E.**
+  `expire_overdue_appointments(*, salon, now) -> int` (row count expired, for
+  logging) lives in `booking/services.py`, alongside `cancel_appointment`. A
+  thin `@shared_task`, `expire_pending_payment_appointments`, lives in a new
+  `booking/tasks.py`, mirroring `accounts/tasks.py`'s app-level placement.
+  Keyword-only, `now` explicit with no default — the same convention as
+  `create_appointment` and `cancel_appointment`.
+- **The service's unit is one salon's batch, not one row by id — a
+  deliberate asymmetry with `cancel_appointment`.** If the service instead
+  took a single `appointment_id`, the "what counts as overdue" query would
+  have to live in the task, putting a business rule in the orchestration
+  layer — the same layering mistake the "business logic lives in a service
+  layer, not views" rule already forbids elsewhere in this codebase. So the
+  service owns the overdue query itself; the task's only job is the
+  per-salon loop and tenant binding around it.
+- **Per-row locking, not one lock over the whole batch.** The service first
+  runs an *unlocked* query for candidate ids —
+  `Appointment.objects.filter(salon=salon, status=PENDING_PAYMENT,
+  hold_expires_at__lte=now)` — then, for **each** id, opens its own
+  `transaction.atomic()` and does `Appointment.objects.select_for_update()
+  .get(salon=salon, pk=id)`, rechecks `status` under that lock, and only
+  then transitions and saves. Reasoning: locking all N candidate rows for
+  the duration of a single transaction would (a) widen the blast radius —
+  every one of those rows stays locked for as long as the whole batch takes,
+  contending with a webhook or a cancel request on any of them the entire
+  time; and (b) mean one unexpected failure partway through the batch rolls
+  back the *entire* batch's `atomic()`, undoing expirations already decided
+  earlier in the loop. Independent per-row transactions mirror
+  `cancel_appointment`'s own atomicity granularity instead.
+- **A row whose recheck finds it's no longer `PENDING_PAYMENT` (already
+  `CONFIRMED` or already `EXPIRED`) is silently skipped — no raise.** This
+  is the deliberate contrast with `cancel_appointment`, which raises
+  `InvalidStateTransitionError` on the same kind of recheck failure: a
+  sweep is unattended background cleanup with no user to hand an error to.
+  This silent-skip-on-recheck is also what makes the task idempotent (rule
+  4 of the sweep-vs-webhook policy, § Stage 7 decisions) as a *consequence*
+  of the lock-and-recheck mechanism already required by rule 1, not a
+  separate mechanism bolted on — a redelivered or overlapping run just
+  re-skips rows that already transitioned.
+- **The task loops over `Salon.objects.all()` and binds
+  `tenant_context(salon.id)` per salon, calling the service inside that
+  binding.** `Salon` is the tenant root, not itself tenant-scoped, so this
+  is its plain default manager — matching `ARCHITECTURE.md` § 5's own
+  description of the sweep as the example of a cross-tenant, loop-over-
+  `Salon.objects.all()` task. `now = timezone.now()` is read exactly once
+  in the task, before the loop starts, so every salon processed in one run
+  is judged against the same instant rather than a slightly later one for
+  salons later in the iteration order.
+- **Three safety requirements on the cross-tenant loop**, spelled out
+  explicitly because a loop over every tenant in one process is exactly
+  where a tenant-isolation bug would leak data between salons:
+  1. `tenant_context` is a real context manager whose `finally` resets the
+     context variable on every iteration regardless of outcome, so salon
+     N's context cannot bleed into salon N+1's.
+  2. Each salon's processing (the `tenant_context` binding plus the service
+     call) is wrapped in its own `try`/`except Exception`, logged via
+     `logger.exception` with the salon id, then skipped — one failing salon
+     must not abort the run for every other salon.
+  3. Inside the loop, all reads go through `Appointment.objects` (the
+     tenant-scoped manager) — never `unscoped_objects`. If `tenant_context`
+     were ever left unbound by a future change, `objects` raises
+     `TenantContextMissingError` (`core/tenancy.py`), which is just another
+     exception the per-salon `try`/`except` catches and logs loudly — a
+     crash, never a silent all-salons scan. This is `ARCHITECTURE.md` §
+     5's "unscoped query is the hard path" guarantee holding under a
+     background job specifically, not only under request/response.
+  Deliberately **no** per-row `try`/`except` inside a salon's batch — only
+  per-salon. An unexpected (not merely "already transitioned") error on one
+  row propagates and aborts the rest of that salon's batch for this run,
+  caught only at the per-salon boundary. Swallowing errors row-by-row would
+  let a recurring bug hide behind endless silent skips forever; letting it
+  propagate to the per-salon log is louder, and safe to do because the
+  transition is idempotent — an unprocessed row is still `PENDING_PAYMENT`
+  and is picked up again next run.
+- **`beat_schedule` entry: every 60 seconds, the first entry in the
+  currently-empty `beat_schedule` in `config/celery.py`.** The 15-minute
+  hold (`SLOT_HOLD_DURATION`, § Business rules) is a payment-UX parameter
+  tuned specifically for a 3-D-Secure challenge window — a sweep interval
+  should stay a small fraction of it, not erode the number it was tuned to.
+  At 60 seconds, the worst-case extra hold past `hold_expires_at` is about
+  one minute, under 7% of the 15-minute hold. A 5-minute interval would
+  risk up to 5 minutes of unnecessary extra hold — roughly a third of the
+  hold duration — which would undercut the reasoning the 15-minute figure
+  was chosen under in the first place.
+- **The service returns `int` (a count), not a list of the expired rows or
+  their ids.** Nothing downstream needs the rows themselves right now:
+  there is no API surface for `EXPIRED` (terminal, no client-facing
+  response shape to decide), and Stage 8's refund wiring will do its own
+  lookup of affected rows at refund-processing time rather than receiving
+  them synchronously from this sweep. Consistent with not returning data no
+  caller asks for yet.
+- **Naming: `expire_overdue_appointments` (service) vs.
+  `expire_pending_payment_appointments` (task) — deliberately different
+  names across the two layers**, so a log line or a stack trace makes it
+  unambiguous which layer is talking.
+- **Boundary — what 7.F does not touch:** no refund (an `EXPIRED`
+  appointment's deposit refund is Stage 8, per § Stage 7 decisions' sweep-
+  vs-webhook policy stage split), no `Payment` model or provider call, no
+  notification dispatch. No shared lock helper is factored out with 7.E's
+  `cancel_appointment`, despite both being row-lock-and-recheck patterns on
+  the same model: the two are different enough — one row vs. many, raise vs.
+  silent skip — that abstracting now would be premature; visible
+  duplication of the one-line `select_for_update()` is the honest choice
+  over a shared helper built to fit two call sites that don't actually
+  share a shape yet.
