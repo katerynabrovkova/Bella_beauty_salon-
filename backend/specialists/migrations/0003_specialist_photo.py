@@ -4,15 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('specialists', '0002_alter_specialist_options_specialist_is_active'),
+        ("specialists", "0002_alter_specialist_options_specialist_is_active"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='specialist',
-            name='photo',
+            model_name="specialist",
+            name="photo",
             field=models.CharField(blank=True, max_length=1024, null=True),
         ),
     ]
