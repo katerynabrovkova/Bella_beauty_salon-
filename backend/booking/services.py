@@ -186,3 +186,39 @@ def cancel_appointment(
             update_fields=["status", "cancelled_at", "cancelled_by", "cancellation_reason"]
         )
         return appointment
+
+
+def expire_overdue_appointments(*, salon: Salon, now: dt.datetime) -> int:
+    """
+    docs/DECISIONS.md § Stage 7.F decisions. Requires tenant context to
+    already be bound (core.tenancy.tenant_context) — this function does not
+    bind it itself, same convention as create_appointment/cancel_appointment.
+    Called once per salon by booking.tasks.expire_pending_payment_appointments,
+    which owns the cross-salon loop and the tenant-context binding.
+
+    Candidate ids are found with an unlocked query, then each row is locked
+    and rechecked independently under its own transaction.atomic() — not one
+    lock over the whole batch — so a single row can't hold up or roll back
+    every other row in the same sweep. A row whose recheck finds it's no
+    longer PENDING_PAYMENT (already CONFIRMED or already EXPIRED) is
+    silently skipped, not raised: unlike cancel_appointment, a sweep is
+    unattended background cleanup with no user to hand an error to, and the
+    skip is also what makes a redelivered/overlapping run idempotent (rule 4
+    of the sweep-vs-webhook policy, § Stage 7 decisions).
+    """
+    candidate_ids = Appointment.objects.filter(
+        salon=salon, status=AppointmentStatus.PENDING_PAYMENT, hold_expires_at__lte=now
+    ).values_list("id", flat=True)
+
+    expired_count = 0
+    for appointment_id in candidate_ids:
+        with transaction.atomic():
+            appointment = Appointment.objects.select_for_update().get(
+                salon=salon, pk=appointment_id
+            )
+            if appointment.status != AppointmentStatus.PENDING_PAYMENT:
+                continue
+            appointment.status = AppointmentStatus.EXPIRED
+            appointment.save(update_fields=["status"])
+            expired_count += 1
+    return expired_count
