@@ -1,25 +1,32 @@
 """
-Guest-token-authenticated appointment access (docs/ARCHITECTURE.md § 3, § 4).
-Both routes are single-object: a guest views or cancels exactly the
-appointment named in the URL, authenticated only by the X-Guest-Token
-header, never JWT. Booking creation, availability, and the full
-cancellation service layer (concurrency, notifications, refund triggering)
-are Stage 7/8 work — this only flips status on an already-existing
+Booking endpoints: guest booking creation, and guest-token-authenticated
+appointment access (docs/ARCHITECTURE.md § 3, § 4).
+
+GuestAppointmentDetailView/GuestAppointmentCancelView are single-object: a
+guest views or cancels exactly the appointment named in the URL,
+authenticated only by the X-Guest-Token header, never JWT. Both are DRF
+generics, not plain APIView, specifically so check_object_permissions() is
+guaranteed to run (DRF generics call it automatically inside get_object())
+— see CLAUDE.md's "DRF object-level permissions" rule and
+core/permissions.py's HasValidGuestToken docstring. The full
+concurrency-safe cancellation service layer (notifications, refund
+triggering) is Stage 8 work — this only flips status on an already-existing
 Appointment.
 
-Both views are DRF generics, not plain APIView, specifically so
-check_object_permissions() is guaranteed to run (DRF generics call it
-automatically inside get_object()) — see CLAUDE.md's "DRF object-level
-permissions" rule and core/permissions.py's HasValidGuestToken docstring.
+GuestBookingCreateView (§ Stage 7.D decisions) is the one write path with no
+object to guard yet — it creates the Appointment — so it's a plain APIView,
+not a generic.
 """
 
 from django.db.models import QuerySet
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework import generics
+from rest_framework import generics, status
+from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.views import APIView
 
 from booking.models import (
     ACTIVE_APPOINTMENT_STATUSES,
@@ -27,9 +34,16 @@ from booking.models import (
     AppointmentStatus,
     CancelledBy,
 )
-from booking.serializers import AppointmentGuestSerializer
+from booking.serializers import (
+    AppointmentCreatedSerializer,
+    AppointmentGuestSerializer,
+    GuestBookingRequestSerializer,
+)
+from booking.services import create_guest_appointment
 from core.exceptions import InvalidOrExpiredTokenError, InvalidStateTransitionError
 from core.permissions import HasValidGuestToken
+from core.tenancy import get_current_salon_id
+from tenants.models import Salon
 
 
 class _GuestTokenAppointmentMixin:
@@ -100,3 +114,52 @@ class GuestAppointmentCancelView(_GuestTokenAppointmentMixin, generics.GenericAP
         token_row.save(update_fields=["cancelled_via_token_at"])
 
         return Response(self.get_serializer(appointment).data)
+
+
+class GuestBookingCreateView(APIView):
+    """
+    Guest booking creation (docs/DECISIONS.md § Stage 7.D decisions). Public
+    write (AllowAny), set explicitly — DEFAULT_PERMISSION_CLASSES is
+    IsAuthenticated globally, so omitting this would silently block the
+    unauthenticated guests this endpoint exists for.
+
+    No view-level try/except: SlotNotOfferedError (400) and
+    SlotUnavailableError (409), both raised by create_guest_appointment via
+    the § Stage 7.C core it wraps, propagate to the existing
+    core.exceptions.exception_handler, already wired as DRF's global
+    EXCEPTION_HANDLER.
+    """
+
+    permission_classes = [AllowAny]
+
+    def post(self, request: Request, *args: object, **kwargs: object) -> Response:
+        body = GuestBookingRequestSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+
+        # Salon is not a TenantScopedModel — it's the tenant root — so
+        # Salon.objects is a plain manager (§ Stage 6.I decisions' same
+        # reasoning).
+        salon = get_object_or_404(Salon, pk=get_current_salon_id())
+
+        # The single now = timezone.now() call site (§ Stage 6.F/6.I
+        # decisions) — passed explicitly into the orchestrator, never re-read.
+        now = timezone.now()
+
+        appointment, raw_token = create_guest_appointment(
+            salon=salon,
+            specialist=body.validated_data["specialist"],
+            service=body.validated_data["service"],
+            start_datetime=body.validated_data["start_datetime"],
+            now=now,
+            customer_name=body.validated_data["customer_name"],
+            customer_email=body.validated_data["customer_email"],
+            customer_phone=body.validated_data["customer_phone"],
+        )
+
+        return Response(
+            {
+                "appointment": AppointmentCreatedSerializer(appointment).data,
+                "token": raw_token,
+            },
+            status=status.HTTP_201_CREATED,
+        )

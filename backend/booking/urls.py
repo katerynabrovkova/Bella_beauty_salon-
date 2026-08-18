@@ -6,6 +6,11 @@ app_name = "booking"
 
 urlpatterns = [
     path(
+        "bookings/",
+        views.GuestBookingCreateView.as_view(),
+        name="guest-booking-create",
+    ),
+    path(
         "guest/appointments/<int:appointment_id>/",
         views.GuestAppointmentDetailView.as_view(),
         name="guest-appointment-detail",
