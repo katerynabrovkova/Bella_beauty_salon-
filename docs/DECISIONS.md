@@ -2074,3 +2074,25 @@ design proposal for this sub-step). Recorded here as agreed.
   translates any raised `DomainError` into its structured response, the same
   mechanism already used for every other domain error in this codebase — the
   view calls the orchestrator directly and lets exceptions propagate.
+- **201 response envelope: the created appointment nests under an
+  `"appointment"` key, with the raw guest token as a sibling top-level
+  `"token"` key** — `{"appointment": {<serialized appointment>}, "token":
+  "<raw token>"}`. This is the first endpoint in the codebase returning a
+  created resource plus an out-of-band value in the same body: the existing
+  `ListCreateAPIView` create endpoints (`catalog/views.py`,
+  `specialists/views.py`) return the bare serialized object with no sibling
+  keys, and no other endpoint combines a resource with a token in its
+  response — so this sets the convention here rather than inheriting one.
+  Nesting keeps the two things honestly separated: `"appointment"` is the
+  resource, `"token"` is a temporary access credential, not a property of
+  the appointment — a flat shape would present the token as if it were an
+  appointment field. It also makes the Stage 9 reversal (§ Stage 7.D
+  decisions above, "Raw guest token placement") clean: deleting the
+  `"token"` key at that point leaves the `"appointment"` object's own shape
+  untouched, where a flat shape would leave a gap among the resource's
+  fields. Consistent with the project's existing preference for a
+  top-level-object body over a bare payload (e.g. `{"available_times":
+  [...]}` on the availability endpoints, § Stage 6.I decisions) — the body
+  names what each part is and leaves room for metadata. This entry fixes
+  only the envelope shape; which fields the appointment serializer exposes
+  is undecided here and belongs to the serializer step.
