@@ -176,6 +176,54 @@ def test_cancel_is_rejected_for_an_appointment_not_in_an_active_status(
     assert response.data["error"]["code"] == "invalid_state_transition"
 
 
+def test_cancel_updates_both_the_appointment_and_the_token_row(client, salon, appointment, token):
+    """
+    Stage 7.E: the guest cancel view is rewritten to call
+    booking.services.cancel_appointment, which knows nothing about
+    GuestAccessToken. The token row's cancelled_via_token_at update is the
+    thing most at risk of being dropped when the inline logic moves into the
+    service — proving both effects land guards the rewrite.
+    """
+    response = client.post(_cancel_url(salon, appointment), HTTP_X_GUEST_TOKEN=token)
+
+    assert response.status_code == 200
+    with tenant_context(salon.id):
+        appointment.refresh_from_db()
+        token_row = GuestAccessToken.objects.get(appointment=appointment)
+    assert appointment.status == AppointmentStatus.CANCELLED
+    assert token_row.cancelled_via_token_at is not None
+
+
+def test_cancel_of_an_already_cancelled_appointment_surfaces_the_services_exception(
+    client, salon, customer, specialist, service
+):
+    """
+    Appointment cancelled through some other path (not this token) before
+    this guest ever tries to cancel — so token validation (for_cancel=True,
+    gated on *this token's own* cancelled_via_token_at) succeeds, and the
+    request reaches booking.services.cancel_appointment, which must reject
+    it. Proves InvalidStateTransitionError propagates through the view via
+    core.exceptions.exception_handler with no view-level try/except, and
+    that .details reaches the response body.
+    """
+    already_cancelled = make_appointment(
+        salon=salon,
+        customer=customer,
+        specialist=specialist,
+        service=service,
+        start=START,
+        status=AppointmentStatus.CANCELLED,
+    )
+    with tenant_context(salon.id):
+        raw_token, _row = issue_guest_token(already_cancelled)
+
+    response = client.post(_cancel_url(salon, already_cancelled), HTTP_X_GUEST_TOKEN=raw_token)
+
+    assert response.status_code == 409
+    assert response.data["error"]["code"] == "invalid_state_transition"
+    assert response.data["error"]["details"] == {"current_status": AppointmentStatus.CANCELLED}
+
+
 # --- guest token has no power elsewhere ------------------------------------
 
 

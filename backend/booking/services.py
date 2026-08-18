@@ -31,7 +31,7 @@ from booking.constants import SLOT_HOLD_DURATION
 from booking.guest_tokens import issue_guest_token
 from booking.models import ACTIVE_APPOINTMENT_STATUSES, Appointment, AppointmentStatus
 from catalog.models import Service
-from core.exceptions import SlotNotOfferedError, SlotUnavailableError
+from core.exceptions import InvalidStateTransitionError, SlotNotOfferedError, SlotUnavailableError
 from scheduling.services import compute_candidate_start_times
 from specialists.models import Specialist
 from tenants.models import Salon
@@ -152,3 +152,37 @@ def create_guest_appointment(
         )
         raw_token, _token_row = issue_guest_token(appointment)
         return appointment, raw_token
+
+
+def cancel_appointment(
+    *,
+    appointment_id: int,
+    salon: Salon,
+    cancelled_by: str,
+    now: dt.datetime,
+    reason: str = "",
+) -> Appointment:
+    """
+    docs/DECISIONS.md § Stage 7.E decisions. Role-agnostic — knows nothing
+    about guest tokens; callers (e.g. the guest cancel view) handle their
+    own credential-specific side effects after this returns.
+
+    The select_for_update() fetch and the ACTIVE_APPOINTMENT_STATUSES
+    recheck both happen inside the same atomic() block, in that order, so
+    the row is locked before its status is read — closing the lost-update
+    window a future concurrent sweep (Stage 7.F) could otherwise race
+    through between an unlocked read and the write.
+    """
+    with transaction.atomic():
+        appointment = Appointment.objects.select_for_update().get(salon=salon, pk=appointment_id)
+        if appointment.status not in ACTIVE_APPOINTMENT_STATUSES:
+            raise InvalidStateTransitionError(details={"current_status": appointment.status})
+
+        appointment.status = AppointmentStatus.CANCELLED
+        appointment.cancelled_at = now
+        appointment.cancelled_by = cancelled_by
+        appointment.cancellation_reason = reason
+        appointment.save(
+            update_fields=["status", "cancelled_at", "cancelled_by", "cancellation_reason"]
+        )
+        return appointment

@@ -28,19 +28,14 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from booking.models import (
-    ACTIVE_APPOINTMENT_STATUSES,
-    Appointment,
-    AppointmentStatus,
-    CancelledBy,
-)
+from booking.models import Appointment, CancelledBy
 from booking.serializers import (
     AppointmentCreatedSerializer,
     AppointmentGuestSerializer,
     GuestBookingRequestSerializer,
 )
-from booking.services import create_guest_appointment
-from core.exceptions import InvalidOrExpiredTokenError, InvalidStateTransitionError
+from booking.services import cancel_appointment, create_guest_appointment
+from core.exceptions import InvalidOrExpiredTokenError
 from core.permissions import HasValidGuestToken
 from core.tenancy import get_current_salon_id
 from tenants.models import Salon
@@ -93,22 +88,25 @@ class GuestAppointmentCancelView(_GuestTokenAppointmentMixin, generics.GenericAP
     def post(self, request: Request, *args: object, **kwargs: object) -> Response:
         appointment = self.get_object()
 
-        if appointment.status not in ACTIVE_APPOINTMENT_STATUSES:
-            raise InvalidStateTransitionError(
-                f"Cannot cancel an appointment with status '{appointment.status}'."
-            )
-
+        # The single now = timezone.now() call site for this request (§
+        # Stage 6.F/6.I decisions), passed explicitly into the service and
+        # reused below for the token update.
         now = timezone.now()
-        appointment.status = AppointmentStatus.CANCELLED
-        appointment.cancelled_at = now
-        appointment.cancelled_by = CancelledBy.GUEST
-        appointment.save(update_fields=["status", "cancelled_at", "cancelled_by"])
+
+        # No try/except: InvalidStateTransitionError propagates to the
+        # existing core.exceptions.exception_handler (409 + details).
+        # cancel_appointment is role-agnostic and knows nothing about guest
+        # tokens — the cancelled_via_token_at update stays here.
+        appointment = cancel_appointment(
+            appointment_id=appointment.id,
+            salon=appointment.salon,
+            cancelled_by=CancelledBy.GUEST,
+            now=now,
+        )
 
         # Refund eligibility (deposit refunded/forfeited depending on
         # cancelled_by/timing, docs/DECISIONS.md § Business rules) is Stage 8
-        # work — hook it in here once Payment exists. Stage 7 also still
-        # owns the full concurrency-safe cancellation service layer this
-        # narrow guest path bypasses for now.
+        # work — hook it in here once Payment exists.
         token_row = request.guest_access_token  # type: ignore[attr-defined]
         token_row.cancelled_via_token_at = now
         token_row.save(update_fields=["cancelled_via_token_at"])
