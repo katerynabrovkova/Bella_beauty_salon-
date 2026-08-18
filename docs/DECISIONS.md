@@ -2042,3 +2042,35 @@ Recorded here as agreed.
   subclasses are anticipated — every failure path funnels through
   `create_appointment`'s existing `SlotNotOfferedError`/
   `SlotUnavailableError`, or an unexpected `IntegrityError`.
+
+### Stage 7.D decisions (guest booking POST endpoint)
+
+Decided 2026-08-18, agreed directly in discussion (no separate written
+design proposal for this sub-step). Recorded here as agreed.
+
+- **Raw guest token placement in the 201 response body — TEMPORARY.**
+  Closes the deferral recorded in § Stage 7.C-bis decisions ("whether the §
+  Stage 7.D `POST` endpoint puts it in the response body in the meantime, or
+  holds it back until Stage 9 exists, is a 7.D decision, deliberately **not**
+  decided here"). Resolved: the endpoint returns the raw guest token in the
+  201 response body, **for now**. This is explicitly temporary and will be
+  removed once Stage 9 (email) lands, at which point the token moves into an
+  email link instead. Reasoning: email does not physically exist until Stage
+  9, so an email-only rule today would make the token a dead artifact —
+  generated, stored, but delivered through no channel, leaving the guest
+  unable to either view or cancel the booking they just made. There are no
+  live users yet, so returning the token in the body now carries no leak
+  risk into anyone's browser history or logs, and it is what makes manual
+  end-to-end testing of the create → view → cancel flow possible before
+  email exists. This is a sequence-in-time decision (response body now,
+  email later) — not an email-vs-response-body tradeoff. When Stage 9
+  reverses this, the reversal must be recorded as its own dated entry that
+  preserves this original reasoning, not a backdated edit to this entry.
+- **Error mapping: no `try`/`except` in the view.** `SlotNotOfferedError`
+  (400, `SLOT_NOT_OFFERED`) and `SlotUnavailableError` (409,
+  `SLOT_NO_LONGER_AVAILABLE`) are both already `DomainError` subclasses
+  carrying their own `status_code`, raised by the § Stage 7.C core the
+  orchestrator wraps. The existing `core/exceptions.exception_handler`
+  translates any raised `DomainError` into its structured response, the same
+  mechanism already used for every other domain error in this codebase — the
+  view calls the orchestrator directly and lets exceptions propagate.
