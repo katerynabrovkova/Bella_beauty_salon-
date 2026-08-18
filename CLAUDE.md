@@ -12,6 +12,13 @@ entry there to notarize a change you already made — if a decision needed appro
 didn't get it first, the write-up must say so plainly (what changed, what alternative
 existed, that approval came after the fact), not read as if it were agreed in advance.
 
+**An entry records the decision and its date, not a review process.** Don't write that
+an entry "follows a design-analysis proposal that was reviewed and approved," or
+anything describing proposal/review/approval machinery, unless a written proposal
+document actually exists and the entry links to it — decisions here are agreed in
+discussion, not through a formal review pipeline. Describing a process that didn't
+happen is the same class of error as recording a fact that isn't true.
+
 **The two docs split along "what" vs. "why," not by topic.** `docs/ARCHITECTURE.md`
 describes what this system is — domain entities, mechanisms, invariants — and stays at
 that level even as later stages land; `docs/DECISIONS.md` carries why a given shape was
