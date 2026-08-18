@@ -2096,3 +2096,119 @@ design proposal for this sub-step). Recorded here as agreed.
   names what each part is and leaves room for metadata. This entry fixes
   only the envelope shape; which fields the appointment serializer exposes
   is undecided here and belongs to the serializer step.
+
+### Stage 7.E decisions (cancellation service layer)
+
+Decided 2026-08-18 in discussion, before implementation, per CLAUDE.md's
+design-first workflow — read against the current on-disk state of
+`booking/services.py`, `booking/views.py`, `booking/models.py`, and
+`core/exceptions.py`, verified fresh rather than from memory. Recorded here
+as agreed.
+
+- **A general, role-agnostic cancellation service, `cancel_appointment`, is
+  introduced.** Signature: `cancel_appointment(*, appointment_id, salon,
+  cancelled_by, now, reason="") -> Appointment`. Keyword-only, `now`
+  explicit with no default — matching `create_appointment`'s (§ Stage 7.C
+  decisions) own convention. It serves all cancel paths (guest, logged-in
+  customer, staff); the caller passes **who** is cancelling via
+  `cancelled_by`, one of the existing `CancelledBy` choices. This step
+  rewrites the existing inline `GuestAppointmentCancelView.post` logic as a
+  thin call to this service. Customer/staff views are **not** written in
+  this step — there is no UI to attach them to yet — the service is simply
+  ready for them when those stages land.
+- **The service fetches the row itself, under the lock — it takes
+  `appointment_id` and `salon`, not a pre-fetched `Appointment`.**
+  `select_for_update()` takes the lock at read time; a row fetched earlier
+  by the view and handed in would be a stale, unlocked snapshot, and
+  passing that object into the service does not retroactively lock the row
+  it came from. So `Appointment.objects.select_for_update().get(salon=salon,
+  pk=appointment_id)` is the first statement inside the service's own
+  `atomic()` block. Consequence, accepted deliberately: the guest row is
+  read twice per request — once by the view for token authorization (via
+  `_GuestTokenAppointmentMixin.get_object()`, unlocked, § Stage 3 sub-step 3
+  decisions), once by the service under the lock for the actual mutation.
+  Redundant but correct; threading the lock through the authorization fetch
+  would entangle authz with the transactional mutation, and the
+  authorization fetch has nothing to protect against a concurrent writer —
+  only the mutation does.
+- **The critical section, inside one `atomic()`:** fetch under lock →
+  recheck `status` is still in `ACTIVE_APPOINTMENT_STATUSES` **under the
+  lock** → if not, raise `InvalidStateTransitionError` → else set
+  `status=CANCELLED`, `cancelled_at=now`, `cancelled_by`,
+  `cancellation_reason=reason` → `save(update_fields=[...])`. The recheck
+  must happen under the lock, not before it: without the lock serializing
+  the two writers, a window exists between an early unlocked read and the
+  write where the not-yet-built § 7.F sweep could flip `PENDING_PAYMENT →
+  EXPIRED` on the same row, and cancellation would then blindly overwrite
+  `EXPIRED` back to `CANCELLED` — a lost-update race erasing a legitimate
+  concurrent transition. This is rule 1 of the sweep-vs-webhook policy (§
+  Stage 7 decisions: "both writers take a row lock … and re-check the
+  row's current status under the lock before applying any transition")
+  applied to a new writer pair — cancel vs. sweep — that the original rule
+  didn't name but whose reasoning transfers directly.
+- **Refund handling: approach B.** The service stores raw facts only
+  (`cancelled_by`, `cancelled_at`, optional `reason`). It does **not**
+  compute refund eligibility and does **not** add any refund field to
+  `Appointment`. Stage 8 computes eligibility from `cancelled_by` plus
+  timing, per § Business rules ("`Appointment.cancelled_by` is what refund
+  eligibility is computed from; it is not a bare time comparison").
+  Reasoning: raw facts don't go stale; a stored computed flag would
+  duplicate the source of truth and freeze under today's 24-hour cutoff
+  rule even if that rule is later changed — the facts remain correct
+  inputs to whatever rule is current at refund-processing time, a computed
+  flag would not.
+- **`cancellation_reason` is optional for every role, including staff —
+  never required anywhere.** Staff/owner know the reason personally from
+  context; forcing entry on top of that is bureaucracy with no consumer
+  recorded anywhere in the docs.
+- **The guest-token-specific update
+  (`GuestAccessToken.cancelled_via_token_at`) stays in the guest view, not
+  the service.** The service is role-agnostic; staff and logged-in
+  customers have no guest token to update. The guest view already has
+  `request.guest_access_token` on hand (set by `HasValidGuestToken`) and
+  performs this one-line update itself, immediately after calling the
+  service, using the same `now` passed to both. This mirrors how
+  `create_guest_appointment` (§ Stage 7.C-bis decisions) keeps guest-token
+  issuance in the guest-specific orchestrator rather than the shared core.
+- **Error on cancelling a non-active appointment: a bare
+  `InvalidStateTransitionError`, with the blocking status carried in
+  structured `details`** — `InvalidStateTransitionError(details={
+  "current_status": appointment.status})`, message left at the class
+  `default_message` ("This action isn't valid for the current state.").
+  Verified before deciding this: `DomainError.__init__` (`core/
+  exceptions.py`) already accepts a keyword-only `details: dict | None`
+  parameter, and `exception_handler` already threads it straight into the
+  response envelope's `error.details` — no exception-machinery change
+  needed. `specialists/services.py::soft_delete_specialist`'s
+  `SpecialistHasFutureAppointmentsError(details={...})` is the one existing
+  precedent for exactly this shape (a generic message plus a
+  machine-readable fact in `details`), so this follows established
+  practice rather than introducing a new one. Chosen over the current
+  inline view's f-string message
+  (`f"Cannot cancel an appointment with status '{appointment.status}'."`):
+  a bare raise matches `create_appointment`'s own style (§ Stage 7.C
+  decisions raises `SlotNotOfferedError()`/`SlotUnavailableError()` with no
+  message), and `details` surfaces the same information machine-readably —
+  more useful to a frontend than parsing a sentence, and consistent with
+  the one other place in this codebase that already does this. **Repeat
+  cancellation of an already-`CANCELLED` appointment is an error, not a
+  silent no-op** — a second cancel could arrive from a different role at a
+  different moment than the first, and silently swallowing it would hide
+  something worth surfacing rather than treating it as an unremarkable
+  repeat request.
+- **`Appointment.DoesNotExist` inside the locked fetch propagates as a bare
+  exception from the service; the view translates it to 404 or a
+  token-mismatch response, not the service.** The service doesn't know
+  HTTP and shouldn't decide what a missing row means to an HTTP caller. In
+  the guest path this only fires on a genuine TOCTOU (the row deleted
+  between the view's own earlier resolving read and the service's locked
+  one) — the ordinary "wrong id" case is already caught earlier, by
+  `_GuestTokenAppointmentMixin`'s own resolution before the service is ever
+  called.
+- **Boundary — what 7.E does not touch:** no refund computation, no
+  `Payment` model or provider call, no notification dispatch, no § 7.F
+  sweep task itself — 7.E only establishes the row-lock pattern the sweep
+  will later need to coexist with on the same row, per the critical-section
+  entry above. No shared lock helper is factored out with § 7.F yet — 7.E
+  builds its own clear pattern here; whether it's worth abstracting is a §
+  7.F decision, made by fact once that task exists, not speculatively now.
