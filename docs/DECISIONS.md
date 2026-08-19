@@ -2414,3 +2414,48 @@ design-first workflow. Recorded here as agreed.
   asynchronous shape of the real flow: a mock that self-completes would
   produce green tests for a path that does not exist in production and
   leave the webhook half of the flow untested.
+- **Booking and payment are two separate requests, not one.** `POST
+  /bookings/` creates the `Appointment` (a DB write, atomic, lock released
+  fast). Starting the payment is a separate request. `start_payment` is a
+  network call to the provider — slow, can hang or fail — and wrapping it
+  inside the same DB transaction as the appointment write would hold a row
+  lock and an open transaction open for the provider's latency, coupling
+  database health to an external server. DB transactions must stay short;
+  network calls must live outside them.
+- **Payment endpoint: `POST guest/appointments/<id>/pay/`**, placed
+  alongside `guest/appointments/<id>/cancel/`, using the same guest-token
+  authorization (`HasValidGuestToken`, `_GuestTokenAppointmentMixin`).
+  Paying is another action on one specific appointment authorized by the
+  same token, exactly like cancel — a separate `/payments/` endpoint would
+  have to re-invent which appointment is being paid and who is allowed to
+  pay for it, when that authorization already exists in the
+  guest-appointment group. Segment name is `pay`; method is POST, since it
+  creates a `Payment` and triggers a state-changing action, not a
+  GET/PUT/PATCH/DELETE.
+- **The underlying service is role-agnostic, like `cancel_appointment`: one
+  service, multiple thin views under different URLs over time.** Stage 8
+  builds only the guest view; logged-in-customer and staff payment views are
+  deferred until there is a UI to attach them to.
+- **Response of `POST .../pay/` returns the `client_secret` from the
+  provider's intent object** — the value the frontend needs to complete
+  payment. `provider_reference_id` is stored on
+  `Payment.provider_reference_id` and is not returned to the client: it is
+  the backend's key for correlating the webhook, and the client does
+  nothing with it. Principle: return exactly what the client needs for its
+  next action, nothing more.
+- **Payment may only be initiated from `PENDING_PAYMENT`.** Any other state
+  (`EXPIRED`, `CONFIRMED`, `CANCELLED`) raises `InvalidStateTransitionError`
+  (409) with the current status in `details` (`current_status`), mirroring
+  `cancel_appointment`. This is a single error class on the backend
+  ("appointment not in a payable state"), while `details.current_status`
+  lets the frontend render a distinct human message per state — presentation
+  on the frontend, fact on the backend.
+- **Idempotency: at most one live `PENDING` `Payment` per appointment.** A
+  repeated `POST .../pay/` (double-click, network retry) must not create a
+  second provider intent — it returns the existing intent's `client_secret`.
+  Two live intents on one appointment risk a double charge if both complete
+  (irreversible loss), and `Payment` is one-to-one with `Appointment`, so a
+  second succeeded payment has nowhere to land — same asymmetric-risk logic
+  as the double-refund decision above. A *different* appointment (e.g. the
+  client books a second service) correctly gets its own new intent — the
+  rule is keyed to the specific appointment, not "never create a new one."
