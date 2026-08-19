@@ -1,6 +1,9 @@
+from django.core.validators import RegexValidator
 from django.db import models
 
 from core.models import TimeStamped
+
+_ISO_4217_VALIDATOR = RegexValidator(r"^[A-Z]{3}$")
 
 
 class Salon(TimeStamped):
@@ -21,6 +24,12 @@ class Salon(TimeStamped):
     # Local-time rendering input (docs/DECISIONS.md § Timezone). Default is
     # the demo tenant's own timezone, not a platform-wide assumption.
     timezone = models.CharField(max_length=63, default="Europe/Kyiv")
+
+    # ISO 4217, e.g. "UAH". Deliberately no model-level default — a new
+    # salon must specify its currency explicitly, never silently inherit
+    # UAH (docs/DECISIONS.md § Stage 8 decisions). Frozen onto each Payment
+    # at creation time; see payments.models.Payment.currency.
+    currency = models.CharField(max_length=3, validators=[_ISO_4217_VALIDATOR])
 
     # Business rules — see docs/DECISIONS.md § Business rules for the "why"
     # behind every default below; all are salon-configurable.

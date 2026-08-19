@@ -38,12 +38,12 @@ def _clear_cache():
 
 @pytest.fixture
 def salon(db):
-    return Salon.objects.create(name="Bella Demo Salon", slug="bella-demo")
+    return Salon.objects.create(name="Bella Demo Salon", slug="bella-demo", currency="UAH")
 
 
 @pytest.fixture
 def other_salon(db):
-    return Salon.objects.create(name="Other Salon", slug="other-salon")
+    return Salon.objects.create(name="Other Salon", slug="other-salon", currency="UAH")
 
 
 @pytest.fixture

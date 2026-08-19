@@ -1,7 +1,10 @@
+from django.core.validators import RegexValidator
 from django.db import models
 
 from booking.models import Appointment
 from core.models import TenantScopedModel, TimeStamped
+
+_ISO_4217_VALIDATOR = RegexValidator(r"^[A-Z]{3}$")
 
 
 class PaymentStatus(models.TextChoices):
@@ -25,10 +28,20 @@ class Payment(TenantScopedModel, TimeStamped):
         Appointment, on_delete=models.PROTECT, related_name="payment"
     )
     amount = models.DecimalField(max_digits=10, decimal_places=2)
+    # ISO 4217, frozen from Salon.currency at Payment creation time — copied
+    # once and never mutated afterward, even if the salon later changes its
+    # currency (docs/DECISIONS.md § Stage 8 decisions). No model-level
+    # default; the copying itself is Stage 8.C, not this field addition.
+    currency = models.CharField(max_length=3, validators=[_ISO_4217_VALIDATOR])
     status = models.CharField(
         max_length=32, choices=PaymentStatus.choices, default=PaymentStatus.PENDING
     )
     provider_reference_id = models.CharField(max_length=255, blank=True, db_index=True)
+    # Stuck-refund alert marker, not a new state-machine status — REFUND_PENDING
+    # already describes the state; this is a flag on top of it, set by a
+    # future background sweep (docs/DECISIONS.md § Stage 8 decisions). No
+    # db_index yet — nothing filters on it until an admin view needs to.
+    flagged_for_review = models.BooleanField(default=False)
 
     def __str__(self) -> str:
         return f"Payment for {self.appointment} ({self.status})"
