@@ -2379,3 +2379,38 @@ design-first workflow. Recorded here as agreed.
   Stage 8 produces only the raw signal — the flag and the log. Stage 9
   turns the flag into a notification, alongside the existing
   `PAYMENT_SUCCEEDED` / `PAYMENT_FAILED` trigger types.
+- **`PaymentProvider` is an interface with exactly two methods —
+  `start_payment` and `refund` — the two actions the platform initiates
+  toward the provider.** A webhook is not a method on this interface: it is
+  the provider calling *us* back, the opposite direction, handled by a
+  separate inbound endpoint rather than folded into this contract.
+- **`start_payment` accepts the amount, the currency, and our own reference
+  (the `Payment` id)** so the later webhook can locate which `Payment` to
+  update. It returns an intent object (a typed dataclass), not a
+  success/failure result — at call time no money has moved yet. The
+  returned object carries the provider's `provider_reference_id`, stored on
+  `Payment.provider_reference_id` (the field already exists from Stage 2).
+  The actual outcome (`PENDING → SUCCEEDED`) arrives asynchronously via
+  webhook.
+- **`refund` accepts the original payment's `provider_reference_id` (plus
+  our reference for webhook correlation) and returns an intent object (a
+  typed dataclass) — it does not accept an amount.** A refund reverses the
+  specific existing transaction identified by its provider id; it does not
+  create a new money movement of an arbitrary sum. Business rules always
+  refund the full deposit or nothing (no partial refunds), so the amount is
+  implied by the original payment — taking an amount argument would open a
+  class of errors (refunding the wrong sum) for no benefit. The outcome
+  (`REFUND_PENDING → REFUNDED`) arrives asynchronously via webhook.
+- **The return type of both methods is a typed dataclass, not a dict**, so
+  the contract is statically checkable: mypy guarantees the mock and the
+  real adapter return the same shape, and a mistyped field is caught at
+  check time rather than failing at runtime.
+- **The mock provider (built first, before the real Stripe adapter) must
+  never touch the network.** Its `start_payment` returns a fake
+  `provider_reference_id` and moves no money; it does not synchronously
+  simulate success — `Payment` stays `PENDING` after the call. To drive it
+  to `SUCCEEDED`, a test sends a fake webhook to the inbound endpoint,
+  exactly as the real provider would. This keeps the mock honest about the
+  asynchronous shape of the real flow: a mock that self-completes would
+  produce green tests for a path that does not exist in production and
+  leave the webhook half of the flow untested.
