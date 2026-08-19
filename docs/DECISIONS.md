@@ -2501,3 +2501,32 @@ design-first workflow. Recorded here as agreed.
   only for an invalid signature or a malformed body. The provider retries on
   any non-200, so a non-200 on a deliberately-ignored event would cause
   pointless redelivery.
+- **A `CheckConstraint` enforces the ISO 4217 format (`^[A-Z]{3}$`) at the
+  database level on both `Salon.currency` and `Payment.currency`.** The
+  `RegexValidator` on the field only fires on `full_clean()` (forms,
+  serializers, admin), not on `.objects.create()`/`.save()`, and a
+  non-nullable `CharField` with no default silently persists `""` when the
+  value is omitted. Without a DB constraint, raw ORM writes can persist
+  `""` or any malformed value (e.g. `"uah"`, `"грн"`) the validator would
+  have rejected. The constraint makes an invalid currency a
+  database-level `IntegrityError` regardless of the write path —
+  enforcement, not reliance on every caller remembering to pass a valid
+  value.
+- **The constraint duplicates the same invariant as the validator (the full
+  `^[A-Z]{3}$` format, not merely "non-empty")** — a constraint that only
+  forbade `""` would still let `"грн"` through, half a guard. To avoid the
+  two enforcement points drifting, the regex pattern string is extracted to
+  one shared module-level constant, used by both the `RegexValidator` and
+  the `CheckConstraint`. One source of truth for the format; the two
+  enforcement layers — Python-level validator, DB-level constraint — share
+  it.
+- **The constraint is applied to both fields, not just `Salon` (the
+  source).** `Payment.currency` is copied from `Salon.currency` by the
+  8.C payment-initiation service, not yet written; a constraint on
+  `Payment` catches an 8.C copy bug rather than trusting it to copy a valid
+  value. Cheap, and it removes a "trust the caller" dependency.
+- **Consequence for tests: a `Salon` or `Payment` created with an
+  invalid/empty currency now raises `IntegrityError`.** The regression test
+  that "creating a row without a valid currency raises" — previously
+  meaningless, since the row silently got `""` — becomes meaningful under
+  this constraint and belongs to 8.B-bis.
