@@ -1,9 +1,7 @@
-from django.core.validators import RegexValidator
 from django.db import models
 
 from core.models import TimeStamped
-
-_ISO_4217_VALIDATOR = RegexValidator(r"^[A-Z]{3}$")
+from core.validators import ISO_4217_PATTERN, iso_4217_validator
 
 
 class Salon(TimeStamped):
@@ -29,7 +27,7 @@ class Salon(TimeStamped):
     # salon must specify its currency explicitly, never silently inherit
     # UAH (docs/DECISIONS.md § Stage 8 decisions). Frozen onto each Payment
     # at creation time; see payments.models.Payment.currency.
-    currency = models.CharField(max_length=3, validators=[_ISO_4217_VALIDATOR])
+    currency = models.CharField(max_length=3, validators=[iso_4217_validator])
 
     # Business rules — see docs/DECISIONS.md § Business rules for the "why"
     # behind every default below; all are salon-configurable.
@@ -40,6 +38,12 @@ class Salon(TimeStamped):
 
     class Meta:
         ordering = ["name"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(currency__regex=ISO_4217_PATTERN),
+                name="salon_currency_iso_4217",
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.name

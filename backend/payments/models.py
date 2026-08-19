@@ -1,10 +1,8 @@
-from django.core.validators import RegexValidator
 from django.db import models
 
 from booking.models import Appointment
 from core.models import TenantScopedModel, TimeStamped
-
-_ISO_4217_VALIDATOR = RegexValidator(r"^[A-Z]{3}$")
+from core.validators import ISO_4217_PATTERN, iso_4217_validator
 
 
 class PaymentStatus(models.TextChoices):
@@ -32,7 +30,7 @@ class Payment(TenantScopedModel, TimeStamped):
     # once and never mutated afterward, even if the salon later changes its
     # currency (docs/DECISIONS.md § Stage 8 decisions). No model-level
     # default; the copying itself is Stage 8.C, not this field addition.
-    currency = models.CharField(max_length=3, validators=[_ISO_4217_VALIDATOR])
+    currency = models.CharField(max_length=3, validators=[iso_4217_validator])
     status = models.CharField(
         max_length=32, choices=PaymentStatus.choices, default=PaymentStatus.PENDING
     )
@@ -42,6 +40,16 @@ class Payment(TenantScopedModel, TimeStamped):
     # future background sweep (docs/DECISIONS.md § Stage 8 decisions). No
     # db_index yet — nothing filters on it until an admin view needs to.
     flagged_for_review = models.BooleanField(default=False)
+
+    class Meta(TenantScopedModel.Meta):
+        abstract = False
+        constraints = [
+            *TenantScopedModel.Meta.constraints,
+            models.CheckConstraint(
+                condition=models.Q(currency__regex=ISO_4217_PATTERN),
+                name="payment_currency_iso_4217",
+            ),
+        ]
 
     def __str__(self) -> str:
         return f"Payment for {self.appointment} ({self.status})"
