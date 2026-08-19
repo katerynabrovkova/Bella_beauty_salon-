@@ -188,15 +188,6 @@ on them, rather than being forgotten and improvised in the moment.
   and goes stale (it will still read "8" two years on); a start date recomputes
   itself and never lies — lean toward the date. Decide before the specialist-profile
   frontend stage.
-- **Stuck refunds — genuinely open, not decided.** The automatic refund
-  described above depends on the payment provider; `REFUND_PENDING →
-  REFUNDED` (§ ARCHITECTURE state machines) can fail or hang (provider down,
-  error, timeout). With no human in the happy path, nothing today catches a
-  refund that silently stays in `REFUND_PENDING` forever. Needs a decision at
-  Stage 8 on how stuck refunds are detected and retried/surfaced (a sweep
-  over aged `REFUND_PENDING` rows, a staff-visible flag, or similar).
-  Recorded now so it isn't improvised when the automatic-refund path above is
-  built.
 
 ## Overall style
 
@@ -2332,3 +2323,59 @@ fresh rather than from memory. Recorded here as agreed.
   duplication of the one-line `select_for_update()` is the honest choice
   over a shared helper built to fit two call sites that don't actually
   share a shape yet.
+
+## Stage 8 decisions (payments)
+
+Decided 2026-08-19 in discussion, before implementation, per CLAUDE.md's
+design-first workflow. Recorded here as agreed.
+
+- **Currency lives on `Salon` as `Salon.currency`, and is frozen onto each
+  `Payment` as `Payment.currency` at creation time** — copied from the salon
+  and never mutated afterward, even if the salon later changes its currency.
+  Same snapshot pattern as `Appointment.deposit_percentage_at_booking`: a
+  later change to the live setting must never rewrite what an existing
+  payment already committed to.
+- **Format: ISO 4217 three-letter uppercase code** (e.g. `UAH`, `USD`,
+  `EUR`), enforced by a validator (exactly three uppercase letters) —
+  **not** a free-text field and **not** a hardcoded `TextChoices` of
+  specific currencies; any valid ISO code is allowed. Free text produces
+  inconsistent values (`грн` / `UAH` / `uah`) that Stripe would reject; a
+  hardcoded enum would block adding currencies later.
+- **The platform operates each `Payment` in a single currency (the salon's)
+  only.** Multi-currency at checkout — a client paying with a card in a
+  different currency — is handled entirely by the payment provider/bank via
+  conversion; the platform never computes, stores, or displays an exchange
+  rate or a converted amount. `Payment.amount` and `Payment.currency` always
+  reflect the salon's currency only.
+- **Deposit rounding: `deposit_amount = round_half_up
+  (service_price_at_booking × deposit_percentage_at_booking)`, to a whole
+  currency unit (0 decimal places in value).** Read from the booking-time
+  snapshots on `Appointment`, never from live `Service.price` or
+  `Salon.deposit_percentage`, per § 8's existing deposit-calculation rule.
+  `Payment.amount` remains `DecimalField(decimal_places=2)` physically, but
+  the stored value is always whole (e.g. `83.00`) — rounding is a write-time
+  rule, not a field constraint.
+- **The in-person remainder (80%) is not stored.** It is derived when needed
+  as `service_price_at_booking − deposit_amount`. Because the remainder is
+  derived from the full price and the already-rounded deposit, rounding the
+  deposit up is automatically consistent — the two always sum to the full
+  price, with no separate reconciliation needed.
+- **Stuck refunds: a background Celery sweep flags aged `REFUND_PENDING`
+  rows for human review — it does not re-contact the provider or attempt an
+  automatic retry.** Automatic retry risks a double refund (irreversible
+  loss for the salon; a dishonest client won't report it), and the mock
+  provider cannot answer a re-query honestly. The risk is asymmetric: a
+  delayed refund is recoverable, a double refund is not. Automatic retry may
+  be revisited once the real Stripe adapter — which supports idempotent
+  refund re-queries — exists.
+- **The stuck threshold is a platform constant (default 72 hours), not a
+  per-salon field.** Refund settlement time is a property of the payment
+  system, uniform across salons, not a per-salon business decision.
+- **The stuck state is a boolean flag on `Payment` (e.g.
+  `flagged_for_review`) plus a warning-level log — not a new status in the
+  payment state machine.** `REFUND_PENDING` already describes the state;
+  "stuck" is an alert marker on top of it, not a new machine state.
+- **Notification to a human (email/admin alert) is deferred to Stage 9.**
+  Stage 8 produces only the raw signal — the flag and the log. Stage 9
+  turns the flag into a notification, alongside the existing
+  `PAYMENT_SUCCEEDED` / `PAYMENT_FAILED` trigger types.
