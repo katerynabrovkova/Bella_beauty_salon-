@@ -2459,3 +2459,45 @@ design-first workflow. Recorded here as agreed.
   as the double-refund decision above. A *different* appointment (e.g. the
   client books a second service) correctly gets its own new intent — the
   rule is keyed to the specific appointment, not "never create a new one."
+- **The webhook is a top-level `POST /api/v1/webhooks/payments/`, outside
+  the tenant `/salons/<slug>/` prefix.** The caller is the provider, not a
+  salon-scoped client — the provider does not know salon slugs and posts to
+  one fixed URL. The salon/tenant is resolved from the event itself
+  (`provider_reference_id` → `Payment` → `salon`), never from the URL.
+- **Authentication is by provider signature, not by guest token or
+  session** — the caller is the provider, not our client. Every event is
+  signature-verified (provider webhook signing secret) before any
+  processing; an invalid signature is rejected. The mock cannot verify a
+  real signature, but the verification step must exist in the code so the
+  real Stripe adapter fills it in — without it the webhook URL is an open
+  door: anyone could POST `payment_succeeded` and confirm a booking for
+  free.
+- **Event types handled: `payment_succeeded`, `payment_failed`,
+  `refund_succeeded`.** All other event types are ignored, with a 200.
+- **`payment_succeeded`: locate `Payment` by `provider_reference_id`, take a
+  row lock, and re-read status under the lock, then in one transaction
+  transition `Payment PENDING → SUCCEEDED` and `Appointment
+  PENDING_PAYMENT → CONFIRMED`** (the two coupled machines per
+  `ARCHITECTURE.md` § 8). Re-reading status under the lock, not before it,
+  is sweep-vs-webhook rule 1 — the same pattern as Stage 7.E/7.F, applied to
+  a new writer pair (webhook vs. expiry sweep).
+- **A webhook finding the appointment already `EXPIRED` (the 7.F sweep won
+  the race) does not resurrect it to `CONFIRMED`** — that would double-book
+  a released slot. Money arrived for something no longer held, so it
+  initiates an automatic refund (`Payment → REFUND_PENDING`) instead. This
+  is sweep-vs-webhook rule 3.
+- **`payment_failed`: `Payment → FAILED`; `Appointment` stays
+  `PENDING_PAYMENT`** — the client may retry while the hold is still live.
+- **`refund_succeeded`: `Payment REFUND_PENDING → REFUNDED`.**
+- **Idempotency via `ProcessedWebhookEvent`** (model already exists from
+  Stage 2, unique on `provider_event_id`): the first step of handling checks
+  whether `provider_event_id` is already recorded; if so, return 200 and do
+  nothing. Otherwise process and record the event id. The provider may
+  redeliver the same event; the effect must apply exactly once.
+  State-transition handlers are additionally idempotent on their own
+  (`PENDING → SUCCEEDED` applied twice is a no-op, not an error).
+- **Response contract: return 200 OK quickly for everything accepted —
+  including ignored event types and duplicate events.** Return a 4xx/5xx
+  only for an invalid signature or a malformed body. The provider retries on
+  any non-200, so a non-200 on a deliberately-ignored event would cause
+  pointless redelivery.
