@@ -2558,8 +2558,11 @@ Decided 2026-08-20, in discussion.
   Stage 8 code regardless.
 - **Initiation is idempotent per appointment.** If a `Payment` in `PENDING`
   status already exists for the appointment, return the existing one (no
-  second intent). If the previous `Payment` is `FAILED`, create a new one
-  (retry allowed).
+  second intent). A previous `FAILED` payment is retried *in place*, not by
+  creating a second row: `Payment.appointment` is a `OneToOneField`, so at
+  most one `Payment` row can exist per appointment. The same row (same pk)
+  transitions `FAILED` → `PENDING` and gets a new `provider_reference_id` (a
+  retry is a new provider transaction).
 - **Paying an appointment not in `PENDING_PAYMENT` raises
   `InvalidStateTransitionError` (HTTP 409), reusing the existing exception +
   handler already used by `cancel_appointment`.** No new error class. 409
@@ -2571,3 +2574,7 @@ Decided 2026-08-20, in discussion.
   Rationale: idempotency here means "do not create a second payment," not
   "re-issue the provider instruction." The frontend is responsible for
   retaining the `provider_data` it received on the first response.
+- **Provider-call failure: if `provider.start_payment()` raises, the
+  service raises a domain `PaymentProviderError` that maps to HTTP 502 Bad
+  Gateway** (the external provider failed, not our code). No `Payment` row
+  is written in that case.
