@@ -188,6 +188,13 @@ on them, rather than being forgotten and improvised in the moment.
   and goes stale (it will still read "8" two years on); a start date recomputes
   itself and never lies — lean toward the date. Decide before the specialist-profile
   frontend stage.
+- **"Resume payment"** — if the client loses the frontend state (closed the
+  tab, returned minutes later while the hold is still alive), the one-shot
+  `provider_data` is gone from both frontend and DB. Re-issuing it would need
+  a new provider method to fetch instructions for an existing intent.
+  Deferred until the frontend exists (Stage 14+), since the shape depends on
+  how the frontend holds state. Distinct from the double-click case (§ Stage
+  8.C decisions).
 
 ## Overall style
 
@@ -2557,3 +2564,10 @@ Decided 2026-08-20, in discussion.
   `InvalidStateTransitionError` (HTTP 409), reusing the existing exception +
   handler already used by `cancel_appointment`.** No new error class. 409
   Conflict = valid request conflicting with resource state.
+- **Idempotency on duplicate submit (double-click / network retry): a
+  repeated `POST` while a `PENDING` `Payment` already exists for the
+  appointment does not call the provider again and does not create a second
+  intent.** It returns the existing payment with `provider_data = null`.
+  Rationale: idempotency here means "do not create a second payment," not
+  "re-issue the provider instruction." The frontend is responsible for
+  retaining the `provider_data` it received on the first response.
