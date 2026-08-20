@@ -18,7 +18,7 @@ Signatures under test:
     PaymentProvider.refund(*, provider_reference_id: str,
                             reference: str) -> RefundIntent
 
-PaymentIntent carries (provider_reference_id: str, client_secret: str);
+PaymentIntent carries (provider_reference_id: str, provider_data: str | None);
 RefundIntent carries (provider_reference_id: str) only — a new provider-side
 id for the refund transaction itself, never an echo of the payment's own
 provider_reference_id (mirrors Stripe's Refund object having its own id,
@@ -67,7 +67,8 @@ def test_mock_start_payment_returns_payment_intent():
     result = provider.start_payment(amount=Decimal("83.00"), currency="UAH", reference="123")
     assert isinstance(result, PaymentIntent)
     assert result.provider_reference_id.startswith("mock_")
-    assert isinstance(result.client_secret, str) and result.client_secret
+    # docs/DECISIONS.md § Stage 8.C decisions: "The mock returns null."
+    assert result.provider_data is None
 
 
 def test_mock_refund_returns_refund_intent():

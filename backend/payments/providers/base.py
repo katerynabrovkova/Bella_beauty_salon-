@@ -19,10 +19,17 @@ from decimal import Decimal
 @dataclass(frozen=True)
 class PaymentIntent:
     """Returned by start_payment. No money has moved yet — the outcome
-    (PENDING -> SUCCEEDED) arrives asynchronously via webhook."""
+    (PENDING -> SUCCEEDED) arrives asynchronously via webhook.
+
+    provider_data is deliberately provider-neutral (docs/DECISIONS.md §
+    Stage 8.C decisions) — whatever the frontend needs from the provider to
+    continue payment (redirect URL, token, etc.), or None. Not named
+    client_secret: that's Stripe-specific, and Stripe does not permit
+    merchant accounts for Ukraine/Georgia residents, so the real provider
+    will be a local acquirer whose frontend hand-off differs."""
 
     provider_reference_id: str
-    client_secret: str
+    provider_data: str | None
 
 
 @dataclass(frozen=True)

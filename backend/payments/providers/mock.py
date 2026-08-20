@@ -16,9 +16,11 @@ from payments.providers.base import PaymentIntent, PaymentProvider, RefundIntent
 
 class MockPaymentProvider(PaymentProvider):
     def start_payment(self, *, amount: Decimal, currency: str, reference: str) -> PaymentIntent:
+        # provider_data=None per docs/DECISIONS.md § Stage 8.C decisions:
+        # "The mock returns null."
         return PaymentIntent(
             provider_reference_id=f"mock_{uuid4().hex}",
-            client_secret=f"mock_secret_{uuid4().hex}",
+            provider_data=None,
         )
 
     def refund(self, *, provider_reference_id: str, reference: str) -> RefundIntent:
