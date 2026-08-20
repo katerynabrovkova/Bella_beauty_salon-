@@ -49,6 +49,18 @@ class InvalidStateTransitionError(DomainError):
     default_message = "This action isn't valid for the current state."
 
 
+class PaymentProviderError(DomainError):
+    """
+    docs/DECISIONS.md § Stage 8.C decisions: provider.start_payment() raised
+    — the external payment provider failed, not our own code. 502 Bad
+    Gateway, not a 4xx: nothing about the request itself was invalid.
+    """
+
+    code = "payment_provider_error"
+    status_code = status.HTTP_502_BAD_GATEWAY
+    default_message = "The payment provider could not process this request."
+
+
 class CategoryHasActiveServicesError(DomainError):
     code = "category_has_active_services"
     status_code = status.HTTP_409_CONFLICT
