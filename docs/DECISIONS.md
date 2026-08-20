@@ -2436,13 +2436,14 @@ design-first workflow. Recorded here as agreed.
   service, multiple thin views under different URLs over time.** Stage 8
   builds only the guest view; logged-in-customer and staff payment views are
   deferred until there is a UI to attach them to.
-- **Response of `POST .../pay/` returns the `client_secret` from the
-  provider's intent object** — the value the frontend needs to complete
-  payment. `provider_reference_id` is stored on
-  `Payment.provider_reference_id` and is not returned to the client: it is
-  the backend's key for correlating the webhook, and the client does
-  nothing with it. Principle: return exactly what the client needs for its
-  next action, nothing more.
+- **Response of `POST .../pay/` returns the provider-neutral envelope
+  `{"payment": {...}, "provider_data": <provider-specific or null>}`**
+  (revised under Stage 8.C — see § Stage 8.C decisions; superseded the
+  originally-planned `client_secret` field). `provider_reference_id` is
+  stored on `Payment.provider_reference_id` and is not returned to the
+  client: it is the backend's key for correlating the webhook, and the
+  client does nothing with it. Principle: return exactly what the client
+  needs for its next action, nothing more.
 - **Payment may only be initiated from `PENDING_PAYMENT`.** Any other state
   (`EXPIRED`, `CONFIRMED`, `CANCELLED`) raises `InvalidStateTransitionError`
   (409) with the current status in `details` (`current_status`), mirroring
@@ -2452,9 +2453,11 @@ design-first workflow. Recorded here as agreed.
   on the frontend, fact on the backend.
 - **Idempotency: at most one live `PENDING` `Payment` per appointment.** A
   repeated `POST .../pay/` (double-click, network retry) must not create a
-  second provider intent — it returns the existing intent's `client_secret`.
-  Two live intents on one appointment risk a double charge if both complete
-  (irreversible loss), and `Payment` is one-to-one with `Appointment`, so a
+  second provider intent — it returns the existing payment's provider-neutral
+  response (`{"payment": ..., "provider_data": ...}`, per § Stage 8.C
+  decisions). Two live intents on one appointment risk a double charge if
+  both complete (irreversible loss), and `Payment` is one-to-one with
+  `Appointment`, so a
   second succeeded payment has nowhere to land — same asymmetric-risk logic
   as the double-refund decision above. A *different* appointment (e.g. the
   client books a second service) correctly gets its own new intent — the
@@ -2530,3 +2533,27 @@ design-first workflow. Recorded here as agreed.
   that "creating a row without a valid currency raises" — previously
   meaningless, since the row silently got `""` — becomes meaningful under
   this constraint and belongs to 8.B-bis.
+
+## Stage 8.C decisions (payment initiation)
+
+Decided 2026-08-20, in discussion.
+
+- **Payment-initiation response envelope is provider-neutral:
+  `{"payment": {...}, "provider_data": <provider-specific or null>}`.**
+  `provider_data` holds whatever the frontend needs from the provider to
+  continue payment (redirect URL, token, etc.); the mock returns `null`. The
+  shape stays stable across mock and real providers. We deliberately do not
+  put a Stripe-specific field (`client_secret`) in the contract: Stripe does
+  not permit merchant accounts for Ukraine/Georgia residents, so the real
+  provider will be a local acquirer whose frontend hand-off differs — binding
+  the envelope to one provider family would be premature. The concrete
+  provider choice is deferred (a business decision); the mock unblocks all
+  Stage 8 code regardless.
+- **Initiation is idempotent per appointment.** If a `Payment` in `PENDING`
+  status already exists for the appointment, return the existing one (no
+  second intent). If the previous `Payment` is `FAILED`, create a new one
+  (retry allowed).
+- **Paying an appointment not in `PENDING_PAYMENT` raises
+  `InvalidStateTransitionError` (HTTP 409), reusing the existing exception +
+  handler already used by `cancel_appointment`.** No new error class. 409
+  Conflict = valid request conflicting with resource state.
