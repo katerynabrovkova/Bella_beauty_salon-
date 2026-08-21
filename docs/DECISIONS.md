@@ -2590,3 +2590,50 @@ Decided 2026-08-20, in discussion.
   `provider_reference_id` → `Payment` → `appointment` still identifies a
   single `Payment` unambiguously, on both the fresh-creation and the
   retry-in-place path.
+
+## Stage 8.D decisions (guest pay endpoint)
+
+Decided 2026-08-21, in discussion.
+
+- **URL is `POST /api/v1/salons/<slug>/guest/appointments/<int:appointment_id>/pay/`,
+  name `guest-appointment-pay`.** Symmetric sibling of the existing
+  `guest-appointment-cancel` route. `appointment_id` is a URL path segment, so a
+  foreign/nonexistent id yields 404 — the id is the URL address, not a query
+  parameter, same rule as the availability endpoint.
+- **Auth is the same as `cancel`: `HasValidGuestToken` permission +
+  `ScopedRateThrottle` `"guest_token"`.** Not `AllowAny` — access is by token,
+  not public.
+- **Request body is empty.** Everything `initiate_payment` needs is
+  server-side or in the URL (`appointment_id` from the path, `salon` from the
+  slug, provider chosen by the server, `now` from the server clock,
+  amount/currency from the frozen snapshot). The client dictates nothing
+  about the payment — narrower attack surface.
+- **Response envelope is `{"payment": {id, status, amount, currency},
+  "provider_data": null}`**, the neutral envelope mirroring the Stage 8.C
+  decision; `provider_data` is `null` for the mock, not a Stripe
+  `client_secret`. `Payment` fields are deliberately narrow (`id`, `status`,
+  `amount`, `currency`) — service name is intentionally excluded because it
+  is a property of the appointment, not the payment; the client already has
+  appointment data from the `POST /bookings/` response, and the frontend
+  composes both.
+- **Success status is 201 vs 200: 201 Created when a new `Payment` row is
+  created** (fresh path, or a prior `FAILED` payment reused as
+  `FAILED` → `PENDING`); **200 OK when an existing `PENDING` `Payment` is
+  returned unchanged** (the idempotency path). The HTTP status must reflect
+  what actually happened to the resource, so the two are distinguished.
+- **Internal service change enabling the above: `initiate_payment` gains a
+  third return element `created: bool`**, so the return type becomes
+  `tuple[Payment, object | None, bool]`. The idempotency branch returns
+  `created=False`; the new-payment branch (including the `FAILED` →
+  `PENDING` retry-in-place case) returns `created=True`. The view maps
+  `created` → 201, not `created` → 200. The service reports the domain fact
+  ("created or not"); the view translates it to an HTTP status — the service
+  never knows about HTTP status codes. Blast radius of this signature change
+  (verified by grep, 2026-08-21): 1 production site (the definition itself),
+  11 two-tuple unpack sites in `test_payments_initiate_payment.py` that must
+  be updated, 0 tests asserting the tuple's arity/shape. No production caller
+  exists outside `services.py` — the 8.D view does not exist yet.
+- **Error mapping, all via the existing `exception_handler`, no `try`/`except`
+  in the view:** appointment not in `PENDING_PAYMENT` → `InvalidStateTransitionError`
+  → 409; provider failure → `PaymentProviderError` → 502; foreign/nonexistent
+  `appointment_id` → 404.
