@@ -48,7 +48,10 @@ class PaymentProvider(ABC):
     @abstractmethod
     def start_payment(self, *, amount: Decimal, currency: str, reference: str) -> PaymentIntent:
         """
-        reference is our own Payment id, so the later webhook can locate
+        reference is str(appointment.id) — the booking's id, not the Payment
+        id — because no Payment row exists yet at the moment start_payment is
+        called. Payment.appointment_id is unique (OneToOneField), so the
+        appointment id still lets the later webhook resolve unambiguously
         which Payment to update.
         """
 

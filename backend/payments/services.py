@@ -6,14 +6,12 @@ Requires tenant context to already be bound (core.tenancy.tenant_context) —
 this function does not bind it itself, same convention as
 booking/services.py's create_appointment/cancel_appointment.
 
-`reference` passed to `provider.start_payment()` is `str(appointment.id)`,
-not the `Payment` id the original Stage 8 decision described: on a fresh
-attempt no `Payment` row exists yet at call time (§ Stage 8.C's "write the
-row only after a successful provider response"), so a not-yet-existing pk
-can't be used. `Payment.appointment_id` is unique (one-to-one), so
-`appointment.id` is an equally valid webhook-correlation key — but this is a
-deviation from the literal old wording, worth reconciling in
-docs/DECISIONS.md.
+`reference` passed to `provider.start_payment()` is `str(appointment.id)`:
+on a fresh attempt no `Payment` row exists yet at call time (§ Stage 8.C's
+"write the row only after a successful provider response"), so a
+not-yet-existing pk can't be used. `Payment.appointment_id` is unique
+(one-to-one), so `appointment.id` is an equally valid webhook-correlation
+key. See `payments/providers/base.py`'s `start_payment` docstring.
 """
 
 import datetime as dt
