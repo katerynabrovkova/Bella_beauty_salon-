@@ -100,3 +100,42 @@ def initiate_payment(
         )
 
     return payment, intent.provider_data, True
+
+
+def initiate_refund(*, payment_id: int, salon: Salon, provider: PaymentProvider) -> Payment:
+    """
+    docs/DECISIONS.md § Stage 8.F decisions. Mirror-opposite order from
+    `initiate_payment`: the status is written to `REFUND_PENDING` and
+    committed *before* the network call, not after, because here the
+    `Payment` row already exists — there is no "row doesn't exist yet"
+    constraint forcing the provider call first. Writing first makes the
+    failure mode reversible: if `provider.refund()` fails, the row is left
+    `REFUND_PENDING` for the Stage 8.G sweep to flag, rather than risking a
+    double refund from a retry after a crash between a successful provider
+    call and the DB write.
+
+    Status gate is an allowlist, not a reject-list: only `SUCCEEDED`
+    proceeds. `REFUND_PENDING`/`REFUNDED` are idempotent no-ops (refund
+    already in flight or already done). Every other status — including
+    `PROCESSING`, currently never assigned anywhere — is a 409, since none of
+    them ever received money to refund.
+    """
+    with transaction.atomic():
+        payment = Payment.objects.select_for_update().get(salon=salon, pk=payment_id)
+        if payment.status in (PaymentStatus.REFUND_PENDING, PaymentStatus.REFUNDED):
+            return payment
+        if payment.status != PaymentStatus.SUCCEEDED:
+            raise InvalidStateTransitionError(details={"current_status": payment.status})
+
+        payment.status = PaymentStatus.REFUND_PENDING
+        payment.save(update_fields=["status"])
+
+    try:
+        provider.refund(
+            provider_reference_id=payment.provider_reference_id,
+            reference=str(payment.appointment_id),
+        )
+    except Exception as exc:
+        raise PaymentProviderError() from exc
+
+    return payment
