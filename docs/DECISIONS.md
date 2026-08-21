@@ -2392,10 +2392,12 @@ design-first workflow. Recorded here as agreed.
   the provider calling *us* back, the opposite direction, handled by a
   separate inbound endpoint rather than folded into this contract.
 - **`start_payment` accepts the amount, the currency, and our own reference
-  (the `Payment` id)** so the later webhook can locate which `Payment` to
-  update. It returns an intent object (a typed dataclass), not a
-  success/failure result — at call time no money has moved yet. The
-  returned object carries the provider's `provider_reference_id`, stored on
+  (the `Appointment` id — revised under Stage 8.C, see § Stage 8.C
+  decisions; originally planned as the `Payment` id)** so the later webhook
+  can locate which `Payment` to update. It returns an intent object (a
+  typed dataclass), not a success/failure result — at call time no money
+  has moved yet. The returned object carries the provider's
+  `provider_reference_id`, stored on
   `Payment.provider_reference_id` (the field already exists from Stage 2).
   The actual outcome (`PENDING → SUCCEEDED`) arrives asynchronously via
   webhook.
@@ -2578,3 +2580,13 @@ Decided 2026-08-20, in discussion.
   service raises a domain `PaymentProviderError` that maps to HTTP 502 Bad
   Gateway** (the external provider failed, not our code). No `Payment` row
   is written in that case.
+- **`start_payment`'s `reference` argument is `str(appointment.id)`, not the
+  `Payment` id as originally planned in § Stage 8 decisions.** On a fresh
+  attempt no `Payment` row exists yet at call time — § Stage 8.C's
+  write-the-row-only-after-a-successful-provider-response ordering means the
+  provider is called before any `Payment` id exists to pass. `appointment.id`
+  is available at call time and works equally well for webhook correlation:
+  `Payment.appointment_id` is unique (`OneToOneField`), so resolving
+  `provider_reference_id` → `Payment` → `appointment` still identifies a
+  single `Payment` unambiguously, on both the fresh-creation and the
+  retry-in-place path.
