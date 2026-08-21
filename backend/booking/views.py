@@ -38,6 +38,10 @@ from booking.services import cancel_appointment, create_guest_appointment
 from core.exceptions import InvalidOrExpiredTokenError
 from core.permissions import HasValidGuestToken
 from core.tenancy import get_current_salon_id
+from payments.providers.base import PaymentProvider
+from payments.providers.mock import MockPaymentProvider
+from payments.serializers import PaymentGuestSerializer
+from payments.services import initiate_payment
 from tenants.models import Salon
 
 
@@ -112,6 +116,49 @@ class GuestAppointmentCancelView(_GuestTokenAppointmentMixin, generics.GenericAP
         token_row.save(update_fields=["cancelled_via_token_at"])
 
         return Response(self.get_serializer(appointment).data)
+
+
+class GuestAppointmentPayView(_GuestTokenAppointmentMixin, generics.GenericAPIView):
+    """
+    Guest pay endpoint (docs/DECISIONS.md § Stage 8.D decisions). Thin HTTP
+    layer over payments.services.initiate_payment — no try/except: the
+    service's InvalidStateTransitionError/PaymentProviderError, and the
+    token errors from HasValidGuestToken/_GuestTokenAppointmentMixin, all
+    propagate to the existing core.exceptions.exception_handler.
+
+    provider_class is a class attribute, not a module-level instance, so a
+    test can substitute a fake/failing provider via
+    monkeypatch.setattr(GuestAppointmentPayView, "provider_class", ...) — the
+    named contract from § Stage 8.D decisions. A fresh instance is built per
+    request; no state survives across requests.
+    """
+
+    permission_classes = [HasValidGuestToken]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "guest_token"
+    guest_token_action = "pay"
+    serializer_class = PaymentGuestSerializer
+    provider_class: type[PaymentProvider] = MockPaymentProvider
+
+    def post(self, request: Request, *args: object, **kwargs: object) -> Response:
+        appointment = self.get_object()
+
+        # The single now = timezone.now() call site for this request (§
+        # Stage 6.F/6.I decisions), passed explicitly into the service.
+        now = timezone.now()
+
+        provider = self.provider_class()
+        payment, provider_data, created = initiate_payment(
+            appointment_id=appointment.id,
+            salon=appointment.salon,
+            provider=provider,
+            now=now,
+        )
+
+        return Response(
+            {"payment": self.get_serializer(payment).data, "provider_data": provider_data},
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
 
 
 class GuestBookingCreateView(APIView):

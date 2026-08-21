@@ -20,4 +20,9 @@ urlpatterns = [
         views.GuestAppointmentCancelView.as_view(),
         name="guest-appointment-cancel",
     ),
+    path(
+        "guest/appointments/<int:appointment_id>/pay/",
+        views.GuestAppointmentPayView.as_view(),
+        name="guest-appointment-pay",
+    ),
 ]

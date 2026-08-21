@@ -95,12 +95,15 @@ class HasValidGuestToken(BasePermission):
     never reaches that call, e.g. a hypothetical list endpoint.
 
     Every view listing this permission must declare `guest_token_action` as
-    exactly "view" or "cancel", with no default — has_permission denies if
-    it's missing or invalid, so a view that forgets to configure this fails
-    closed instead of silently defaulting to "view" mode. Only "cancel"
-    treats an already-spent cancel capability as invalid
+    exactly "view", "cancel", or "pay", with no default — has_permission
+    denies if it's missing or invalid, so a view that forgets to configure
+    this fails closed instead of silently defaulting to "view" mode. Only
+    "cancel" treats an already-spent cancel capability as invalid
     (docs/DECISIONS.md § Stage 3 decisions: cancelling must not revoke view
-    access).
+    access). "pay" uses for_cancel=False like "view" — paying does not spend
+    the cancel capability, and payability is already gated by
+    initiate_payment's own PENDING_PAYMENT check, not by token state
+    (docs/DECISIONS.md § Stage 8.D decisions).
 
     On success, stashes the validated GuestAccessToken on
     request.guest_access_token — note its `appointment_id` is the
@@ -113,7 +116,7 @@ class HasValidGuestToken(BasePermission):
 
     def has_permission(self, request: Request, view: APIView) -> bool:
         action = getattr(view, "guest_token_action", None)
-        if action not in ("view", "cancel"):
+        if action not in ("view", "cancel", "pay"):
             return False
         raw_token = request.headers.get("X-Guest-Token", "")
         token_row = validate_guest_token(raw_token, for_cancel=(action == "cancel"))

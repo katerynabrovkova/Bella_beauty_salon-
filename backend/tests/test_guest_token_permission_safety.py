@@ -149,4 +149,4 @@ def test_every_view_using_has_valid_guest_token_is_a_drf_generic():
                 f"{view_cls.__name__} uses HasValidGuestToken but isn't a DRF "
                 "generic — check_object_permissions() won't run automatically."
             )
-    assert checked == 2  # both guest appointment views — guards against a silent no-op
+    assert checked == 3  # detail, cancel, and pay — guards against a silent no-op
