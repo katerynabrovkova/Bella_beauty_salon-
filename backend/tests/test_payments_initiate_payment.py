@@ -124,7 +124,7 @@ def test_initiate_payment_happy_path_creates_a_pending_payment(
     provider = _FakeProvider()
 
     with tenant_context(salon.id):
-        payment, _ = initiate_payment(
+        payment, _, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=provider, now=NOW
         )
 
@@ -155,7 +155,7 @@ def test_initiate_payment_persists_provider_reference_id_on_payment(
     provider = _FakeProvider()
 
     with tenant_context(salon.id):
-        payment, _ = initiate_payment(
+        payment, _, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=provider, now=NOW
         )
 
@@ -172,7 +172,7 @@ def test_initiate_payment_returns_provider_data_from_provider_response(
     provider = _FakeProvider()
 
     with tenant_context(salon.id):
-        _, provider_data = initiate_payment(
+        _, provider_data, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=provider, now=NOW
         )
 
@@ -186,7 +186,7 @@ def test_initiate_payment_does_not_store_provider_data_on_the_payment_row(
     provider = _FakeProvider()
 
     with tenant_context(salon.id):
-        payment, _ = initiate_payment(
+        payment, _, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=provider, now=NOW
         )
 
@@ -210,7 +210,7 @@ def test_initiate_payment_amount_is_rounded_half_up_deposit_from_booking_snapsho
     provider = _FakeProvider()
 
     with tenant_context(salon.id):
-        payment, _ = initiate_payment(
+        payment, _, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=provider, now=NOW
         )
 
@@ -227,7 +227,7 @@ def test_initiate_payment_currency_is_frozen_from_salon_currency(
     provider = _FakeProvider()
 
     with tenant_context(salon.id):
-        payment, _ = initiate_payment(
+        payment, _, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=provider, now=NOW
         )
 
@@ -362,7 +362,7 @@ def test_initiate_payment_existing_pending_payment_is_returned_unchanged(
     provider = _FakeProvider()
 
     with tenant_context(salon.id):
-        payment, _ = initiate_payment(
+        payment, _, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=provider, now=NOW
         )
 
@@ -379,7 +379,7 @@ def test_initiate_payment_existing_pending_payment_returns_provider_data_none(
     provider = _FakeProvider()
 
     with tenant_context(salon.id):
-        _, provider_data = initiate_payment(
+        _, provider_data, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=provider, now=NOW
         )
 
@@ -412,7 +412,7 @@ def test_initiate_payment_existing_failed_payment_retries_same_row_with_a_differ
     provider = _FakeProvider()
 
     with tenant_context(salon.id):
-        payment, _ = initiate_payment(
+        payment, _, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=provider, now=NOW
         )
 
@@ -430,7 +430,7 @@ def test_initiate_payment_existing_failed_payment_transitions_status_back_to_pen
     provider = _FakeProvider()
 
     with tenant_context(salon.id):
-        payment, _ = initiate_payment(
+        payment, _, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=provider, now=NOW
         )
 
@@ -509,7 +509,7 @@ def test_initiate_payment_provider_failure_then_retry_succeeds_as_a_fresh_attemp
 
     working_provider = _FakeProvider()
     with tenant_context(salon.id):
-        payment, provider_data = initiate_payment(
+        payment, provider_data, _ = initiate_payment(
             appointment_id=appt.id, salon=salon, provider=working_provider, now=NOW
         )
 

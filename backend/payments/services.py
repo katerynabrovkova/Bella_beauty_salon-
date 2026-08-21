@@ -47,7 +47,7 @@ def initiate_payment(
     salon: Salon,
     provider: PaymentProvider,
     now: dt.datetime,
-) -> tuple[Payment, object | None]:
+) -> tuple[Payment, object | None, bool]:
     """
     docs/DECISIONS.md § Stage 8.C decisions. The select_for_update() fetch,
     the PENDING_PAYMENT recheck, and the existing-Payment check all happen
@@ -60,6 +60,12 @@ def initiate_payment(
     FAILED Payment is retried in place — same row (same pk), transitioned
     FAILED -> PENDING with a new provider_reference_id — never a second row,
     since Payment.appointment is a OneToOneField.
+
+    The third return element, `created`, is a domain fact for the caller to
+    map to an HTTP status (docs/DECISIONS.md § Stage 8.D decisions) — this
+    function has no notion of HTTP status codes itself. False on the
+    idempotency (existing-PENDING) branch; True otherwise, including the
+    FAILED -> PENDING retry-in-place case.
     """
     with transaction.atomic():
         appointment = Appointment.objects.select_for_update().get(salon=salon, pk=appointment_id)
@@ -68,7 +74,7 @@ def initiate_payment(
 
         existing_payment = Payment.objects.filter(appointment=appointment).first()
         if existing_payment is not None and existing_payment.status == PaymentStatus.PENDING:
-            return existing_payment, None
+            return existing_payment, None, False
 
     deposit_amount = _compute_deposit_amount(appointment)
     try:
@@ -95,4 +101,4 @@ def initiate_payment(
             provider_reference_id=intent.provider_reference_id,
         )
 
-    return payment, intent.provider_data
+    return payment, intent.provider_data, True
