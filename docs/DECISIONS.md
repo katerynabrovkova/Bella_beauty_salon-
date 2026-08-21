@@ -2597,12 +2597,20 @@ Decided 2026-08-21, in discussion.
 
 - **URL is `POST /api/v1/salons/<slug>/guest/appointments/<int:appointment_id>/pay/`,
   name `guest-appointment-pay`.** Symmetric sibling of the existing
-  `guest-appointment-cancel` route. `appointment_id` is a URL path segment, so a
-  foreign/nonexistent id yields 404 — the id is the URL address, not a query
-  parameter, same rule as the availability endpoint.
+  `guest-appointment-cancel` route. `appointment_id` is a URL path segment, but
+  because the pay view resolves the appointment from the token (via
+  `_GuestTokenAppointmentMixin`), not the URL, a mismatched URL id is a token
+  error → 400, not 404.
 - **Auth is the same as `cancel`: `HasValidGuestToken` permission +
   `ScopedRateThrottle` `"guest_token"`.** Not `AllowAny` — access is by token,
-  not public.
+  not public. **This requires extending `HasValidGuestToken` itself, a shared
+  permission class in `core/permissions.py` also used by the detail and
+  cancel views**: its allowed-action set changes from `("view", "cancel")` to
+  `("view", "cancel", "pay")`, and `"pay"` uses `for_cancel=False` — paying
+  does not spend the cancel capability; payability is gated by
+  `initiate_payment`'s own `PENDING_PAYMENT` check, not by token state.
+  Recorded here because it alters a shared contract, not something local to
+  the new view.
 - **Request body is empty.** Everything `initiate_payment` needs is
   server-side or in the URL (`appointment_id` from the path, `salon` from the
   slug, provider chosen by the server, `now` from the server clock,
@@ -2635,5 +2643,8 @@ Decided 2026-08-21, in discussion.
   exists outside `services.py` — the 8.D view does not exist yet.
 - **Error mapping, all via the existing `exception_handler`, no `try`/`except`
   in the view:** appointment not in `PENDING_PAYMENT` → `InvalidStateTransitionError`
-  → 409; provider failure → `PaymentProviderError` → 502; foreign/nonexistent
-  `appointment_id` → 404.
+  → 409; provider failure → `PaymentProviderError` → 502; foreign/mismatched
+  `appointment_id` → 400 (`invalid_or_expired_token`) — the pay view reuses
+  `_GuestTokenAppointmentMixin`, which resolves the appointment from the
+  token, so a mismatched URL id is a token error, not a DB lookup; a real 404
+  only if the token's own appointment row were deleted.
