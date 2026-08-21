@@ -2648,3 +2648,83 @@ Decided 2026-08-21, in discussion.
   `_GuestTokenAppointmentMixin`, which resolves the appointment from the
   token, so a mismatched URL id is a token error, not a DB lookup; a real 404
   only if the token's own appointment row were deleted.
+
+## Stage 8.F decisions (refund initiation)
+
+Decided 2026-08-21, in discussion.
+
+- **No client-visible surface.** `initiate_refund` is a purely internal
+  service — the guest never initiates a refund. There is no guest-facing
+  `/refund/` endpoint, hence no external URL, request/response body, or HTTP
+  status/error code to define for it. Its two callers are both system-side:
+  (a) cancellation logic, for the cases where the deposit is refundable; (b)
+  the webhook handler, when a late `payment_succeeded` webhook lands on an
+  already-`EXPIRED` appointment — it initiates a refund rather than
+  resurrecting the slot (sweep-vs-webhook rule 3, § Stage 8 decisions).
+- **What is refunded: always the full deposit, never a partial amount.**
+  Only the deposit is paid online through the provider; the remaining
+  balance is paid in cash at the salon, never enters the system, and has
+  nothing to return. `refund` therefore takes no amount argument — accepting
+  one would open a class of bugs (refunding the wrong sum) for a value that
+  is always implied.
+- **Service signature: `initiate_refund(*, payment_id, salon, provider) ->
+  Payment`.**
+  - Takes `payment_id` and fetches the row itself under
+    `select_for_update()`, so the row lock is held in the same transaction
+    that writes the status — the same reason `cancel_appointment` takes
+    `appointment_id`, not a ready object.
+  - `salon` is passed explicitly for tenant scope: `.get(salon=salon,
+    pk=payment_id)` makes a foreign `payment_id` a `DoesNotExist`, not a
+    cross-tenant leak.
+  - `provider` is injected, as in 8.C, never constructed inside the service.
+  - No `now` parameter: `Payment` has no refund-timestamp field (verified
+    directly against the model — only the inherited `created_at`/`updated_at`
+    from `TimeStamped` exist); refund state is carried entirely by `status`
+    (`REFUND_PENDING` / `REFUNDED`), so there is nothing for a timestamp
+    argument to write.
+- **Operation order is the mirror-opposite of 8.C, deliberately.** Write
+  `SUCCEEDED → REFUND_PENDING` under the lock first, then call
+  `provider.refund()` outside the transaction — a network call must not hold
+  a row lock. Reason: risk asymmetry. If the provider call fails, the row is
+  left `REFUND_PENDING`, which the Stage 8.G sweep flags after 72h —
+  reversible. If the status were instead written only after a successful
+  provider call, a crash between the provider call succeeding and the DB
+  write would leave `SUCCEEDED` with the money already gone, and a retry
+  would call the provider a second time — a double refund, irreversible. The
+  order is chosen for the reversible failure mode. This is the opposite of
+  8.C's order (provider call first, row written after), because in 8.C the
+  row does not exist yet at call time; here it already does — different
+  situations, different order.
+- **Status gate, rechecked under the lock:**
+  - `SUCCEEDED` → transition to `REFUND_PENDING`, then call the provider.
+  - `REFUND_PENDING` / `REFUNDED` → a refund is already in flight or already
+    done; return the existing `Payment` unchanged and do not call the
+    provider again (idempotency, same shape as the existing-`PENDING` branch
+    in 8.C).
+  - Any other status (`PENDING`, `FAILED`, `EXPIRED`, `CANCELLED`) →
+    `InvalidStateTransitionError` (409, `current_status` in `details`). None
+    of these ever received money, so there is nothing to return; a refund
+    requested against one of them means the caller decided to refund
+    something it should not have — a bug in the caller, and the loud error
+    is the detector.
+  - `PROCESSING` is currently an unused `PaymentStatus` enum member — never
+    assigned anywhere in the code (the mock does not model it; verified by
+    grep). It falls into the 409 branch with the other non-`SUCCEEDED`
+    statuses, which is correct for now: a not-yet-successful payment cannot
+    be refunded. Revisit when a real acquirer with a synchronous
+    `PROCESSING` state is added — a refund request arriving during
+    `PROCESSING` would then be a timing race (sweep-vs-webhook category),
+    not a caller bug.
+- **Provider call: `provider.refund(provider_reference_id=payment.provider_reference_id,
+  reference=str(payment.appointment_id))`.** `provider_reference_id`
+  identifies the transaction being reversed; `reference` mirrors
+  `start_payment`'s correlation key.
+- **Scope of 8.F is initiation only:** `SUCCEEDED → REFUND_PENDING` plus the
+  provider call. The confirming transition (`REFUND_PENDING → REFUNDED`) is
+  a branch of the webhook handler on `refund_succeeded`, not a separate
+  service — same as `payment_succeeded` lives in the handler, not a service.
+  Refund eligibility ("does this case qualify for a refund") is also out of
+  scope here: it lives in the caller — the cancellation branch computes it
+  from `cancelled_by` and timing; the EXPIRED-webhook case decides it itself
+  (rule 3). `initiate_refund` receives an already-made refund decision and
+  executes it.
