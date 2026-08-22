@@ -63,3 +63,23 @@ class PaymentProvider(ABC):
         refund the full deposit or nothing, so the amount is implied by the
         original payment.
         """
+
+    def verify_signature(self, *, payload: bytes, signature: str) -> bool:
+        """
+        Verifies an inbound webhook's authenticity (docs/DECISIONS.md §
+        Stage 8.E decisions) — the provider-calls-us direction, the mirror
+        of start_payment/refund's platform-calls-provider direction.
+        payload is the raw, unparsed request body: a real adapter computes
+        an HMAC (or similar) over exactly those bytes and compares it
+        against signature, so verification must happen before anything
+        parses or mutates them.
+
+        Deliberately NOT @abstractmethod: test_payments_providers.py's
+        test_payment_provider_abstract_methods_are_start_payment_and_refund
+        pins PaymentProvider.__abstractmethods__ to exactly
+        {"start_payment", "refund"}. Every concrete provider must still
+        override this — the base implementation raises rather than silently
+        accepting, so a future adapter that forgets to override it fails
+        loudly instead of leaving the webhook endpoint an open door.
+        """
+        raise NotImplementedError

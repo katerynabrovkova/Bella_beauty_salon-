@@ -25,3 +25,10 @@ class MockPaymentProvider(PaymentProvider):
 
     def refund(self, *, provider_reference_id: str, reference: str) -> RefundIntent:
         return RefundIntent(provider_reference_id=f"mock_refund_{uuid4().hex}")
+
+    def verify_signature(self, *, payload: bytes, signature: str) -> bool:
+        # docs/DECISIONS.md § Stage 8.E decisions: "the mock does not verify
+        # a real signature (stub returns True)". It never touches the
+        # network and has no real secret to check against; a real adapter
+        # computes an HMAC over `payload` and compares it to `signature`.
+        return True
