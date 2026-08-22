@@ -2649,6 +2649,84 @@ Decided 2026-08-21, in discussion.
   token, so a mismatched URL id is a token error, not a DB lookup; a real 404
   only if the token's own appointment row were deleted.
 
+## Stage 8.E decisions (payment webhook handler)
+
+Decided 2026-08-21, in discussion.
+
+- **URL is `POST /api/v1/webhooks/payments/`, a top-level path outside the
+  `/api/v1/salons/<slug>/` tenant prefix.** The provider does not know the
+  salon's slug; precedent is `api/v1/auth/`, already top-level in
+  `config/urls.py`. Permission is `AllowAny` — the endpoint is not behind
+  tenant or user auth at all, only behind signature verification (below).
+- **Request body is `{event_id, event_type, provider_reference_id}`.** The
+  signature is carried in a request header, `X-Signature` (a name
+  established here — no prior convention existed), not in the body: the
+  signature is computed over the raw request body, so it must live outside
+  the data it signs.
+- **Payment lookup is `Payment.objects.get(provider_reference_id=...)`
+  directly, then `salon` from that `Payment`.** This differs from the 8.C
+  outbound call, where `provider_reference_id` did not exist yet and
+  `str(appointment.id)` was sent as `reference` instead — here, an inbound
+  webhook carries the provider's own key, which by this point already sits
+  in `Payment.provider_reference_id`.
+  `provider_reference_id` is indexed but not unique; each `start_payment`
+  generates a fresh `uuid4` hex, so a collision cannot occur in practice.
+  Revisit making it unique at the database level later.
+- **Event types handled: `payment_succeeded`, `payment_failed`,
+  `refund_succeeded`.** Any other `event_type` → 200, ignored, no action.
+- **Status codes: 200 for everything accepted and processed, including
+  ignored event types, duplicate events (idempotency), and events landing
+  on an already-`EXPIRED` appointment.** 4xx is reserved for an invalid
+  signature or a broken/unparseable body; 5xx only for our own failure.
+  Duplicates and ignored types return 200 rather than an error because
+  providers retry on non-200 — erroring on an already-processed duplicate
+  would make the provider hammer the endpoint again.
+- **Signature verification is the first step in the view, run against the
+  raw `request.body` bytes, not `request.data`, before the serializer
+  parses anything.** The mock verification stub returns `True`
+  unconditionally rather than checking a real signature, but the method
+  and its call site must exist regardless — without them the URL is an
+  open door, since anyone could `POST` a `payment_succeeded` event. A real
+  provider adapter only fills in the method body later.
+- **Idempotency is enforced by two independent layers, both kept:**
+  - `ProcessedWebhookEvent.provider_event_id` (`unique=True`; the model is
+    global, not tenant-scoped, because the event arrives before the salon
+    is known). The first processing step checks whether `event_id` is
+    already recorded; if so, return 200 with no further action.
+  - The `ProcessedWebhookEvent` insert happens inside the same `atomic()`
+    block as the state transitions it guards, so "processed" and "marked
+    processed" commit together: a crash between them rolls back both, and
+    a retry sees a clean, unprocessed state and processes the event
+    exactly once.
+  - This sits on top of the under-lock status recheck the transitions
+    already perform (below) — two independent layers guarding the single
+    invariant "process each event exactly once," so that weakening either
+    one still leaves the other holding.
+- **State transitions, each row fetched under `select_for_update()` with
+  its status rechecked under the lock before transitioning:**
+  - `payment_succeeded`: `Payment` `PENDING` → `SUCCEEDED` and
+    `Appointment` `PENDING_PAYMENT` → `CONFIRMED`, both in the one
+    transaction — the two state machines are coupled, since a `CONFIRMED`
+    appointment without a `SUCCEEDED` payment would be a lying state. If
+    the appointment is already `EXPIRED` (the § Stage 7.F sweep won the
+    race), do not resurrect it to `CONFIRMED` — that would double-book a
+    slot already released. Instead call `initiate_refund` (sweep-vs-webhook
+    rule 3, § Stage 8 decisions) — the first real caller of the § Stage 8.F
+    service.
+  - `payment_failed`: `Payment` → `FAILED`; `Appointment` stays
+    `PENDING_PAYMENT` — the client may still pay again while the hold is
+    still alive.
+  - `refund_succeeded`: `Payment` `REFUND_PENDING` → `REFUNDED`. This
+    branch lives in the handler itself, not a separate service, the same
+    as `payment_succeeded` above; also written inside the same `atomic()`
+    plus ledger write.
+- **Scope of 8.E is reactive only.** The handler responds to provider
+  events; it does not initiate payments (§ Stage 8.C/8.D) and does not
+  compute refund eligibility itself. The only thing it initiates is the
+  `initiate_refund` call on the `EXPIRED`-appointment case above, which
+  invokes the already-written § Stage 8.F service rather than adding new
+  refund logic.
+
 ## Stage 8.F decisions (refund initiation)
 
 Decided 2026-08-21, in discussion.
